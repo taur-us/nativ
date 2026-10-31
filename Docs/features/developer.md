@@ -55,10 +55,12 @@ as before. The file is read per request, so edits apply without a restart.
 - The app's pre-turn token count (`/v1/responses/input_tokens`) is answered from the engine's own
   `/apply-template` and `/tokenize` routes, so the engine must offer them.
 - `/v1/responses/compact` is not forwarded and returns 501 for these models. The app's automatic
-  compaction does work: when a reply's prompt reaches the threshold the app sent, the engine is asked
-  for a handoff summary (the same prompt plus one instruction, so its prefix cache serves it), and the
-  `compaction` item the app stores holds that summary and a verbatim tail of recent turns. The newest
-  tool-call batch is always kept intact. If the summary fails, the chat continues uncompacted.
+  compaction does work: when a reply's prompt reaches the threshold the app sent, old tool output is
+  replaced by a short placeholder (every message and call is kept, and so is a verbatim tail of recent
+  turns), which costs no model call. If that still leaves the context above 60% of the threshold, as in a
+  long text-only chat, the engine is asked for a handoff summary instead (the same prompt plus one
+  instruction, so its prefix cache serves it). The newest tool-call batch is always kept intact. If the
+  summary fails, the chat continues uncompacted.
 - While an engine's `/status` reports it ready, `/health` and `/metrics` show the listed model as loaded
   with the engine's context size, so the app sizes its compaction threshold from it. The engine's
   `/metrics` memory in use is passed to the app as the peak-memory figure (the engine has no per-reply peak).
