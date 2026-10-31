@@ -419,6 +419,49 @@ class StatusReply:
         return self._body
 
 
+METRICS = b"# HELP x\nsplash_memory_current_bytes 19751714816\nsplash_memory_peak_bytes 35179020288\n"
+TIMED_EVENT = b'event: response.completed\ndata: {"response": {"timings": {"predicted_per_second": 70.0}}}'
+
+
+class EngineMemoryTests(unittest.TestCase):
+    ENGINES = {"qwen": {"base_url": "http://127.0.0.1:8091/v1"}}
+
+    def setUp(self):
+        self.module = load_module()
+
+    def refresh(self, metrics):
+        def reply(request, timeout=None):
+            if request.full_url.endswith("/metrics"):
+                if isinstance(metrics, Exception):
+                    raise metrics
+                return StatusReply(metrics)
+            return StatusReply(b'{"ready": true, "maximum_context_tokens": 262144}')
+        with patch.object(self.module.urllib.request, "urlopen", side_effect=reply):
+            self.module.refresh_ready_engines(self.ENGINES)
+
+    def hoisted_timings(self, event=TIMED_EVENT):
+        data = json.loads(self.module._hoist_timings(event).split(b"data: ")[1])
+        return data["timings"]
+
+    def test_memory_in_use_is_read_in_gb_from_the_engine_metrics(self):
+        self.refresh(METRICS)
+        self.assertEqual(self.module.engine_memory_gb(), 19.75)
+
+    def test_the_hoisted_timings_carry_it_as_peak_memory(self):
+        self.refresh(METRICS)
+        self.assertEqual(self.hoisted_timings(), {"predicted_per_second": 70.0, "peak_memory": 19.75})
+
+    def test_an_engine_peak_already_in_the_timings_is_kept(self):
+        self.refresh(METRICS)
+        event = b'data: {"response": {"timings": {"peak_memory": 3.5}}}'
+        self.assertEqual(self.hoisted_timings(event), {"peak_memory": 3.5})
+
+    def test_without_a_memory_reading_the_timings_get_no_peak(self):
+        for metrics in (OSError("no metrics"), b"nothing useful"):
+            self.refresh(metrics)
+            self.assertEqual(self.hoisted_timings(), {"predicted_per_second": 70.0})
+
+
 class RemoteModelStatusTests(unittest.TestCase):
     ENGINES = {"qwen": {"base_url": "http://127.0.0.1:8091/v1"}}
 
@@ -440,7 +483,7 @@ class RemoteModelStatusTests(unittest.TestCase):
 
     def test_the_status_is_read_from_the_engine_root_not_its_v1_path(self):
         opened = self.refresh(b'{"ready": true}')
-        self.assertEqual(opened.call_args.args[0].full_url, "http://127.0.0.1:8091/status")
+        self.assertEqual(opened.call_args_list[0].args[0].full_url, "http://127.0.0.1:8091/status")
 
     def test_a_configured_limit_below_the_engine_context_wins(self):
         self.refresh(b'{"ready": true, "maximum_context_tokens": 262144}')

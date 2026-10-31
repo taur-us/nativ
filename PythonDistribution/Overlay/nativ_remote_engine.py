@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.request
@@ -45,12 +46,15 @@ SSE_EVENT_END = b"\n\n"
 # Message fields that carry the conversation; everything else Nativ adds is presentation data.
 CHAT_MESSAGE_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name")
 
+# Splash exposes engine-wide memory in use; it reports no per-reply peak, so this stands in for the app's peak figure.
+MEMORY_IN_USE = re.compile(r"^splash_memory_current_bytes\s+(\d+)", re.M)
+BYTES_PER_GB = 1e9
 # How often a ready engine is re-checked, and how long one check may take; requests never wait on it.
 STATUS_REFRESH_S = 5
 STATUS_TIMEOUT_S = 2
 
 _client: httpx.AsyncClient | None = None
-_ready_engines: dict[str, int | None] = {}
+_ready_engines: dict[str, dict[str, Any]] = {}
 _ready_lock = threading.Lock()
 _refresher: threading.Thread | None = None
 
@@ -207,13 +211,32 @@ def _engine_context(engine: dict[str, str]) -> tuple[bool, int | None]:
     return bool(isinstance(status, dict) and status.get("ready")), context if isinstance(context, int) else None
 
 
+def _engine_memory_gb(engine: dict[str, str]) -> float | None:
+    """Engine-wide memory in use, read from the engine's Prometheus /metrics; None when it cannot be read."""
+    root = engine["base_url"].rstrip("/").removesuffix("/v1")
+    request = urllib.request.Request(root + "/metrics", headers=_engine_headers(engine))
+    try:
+        with urllib.request.urlopen(request, timeout=STATUS_TIMEOUT_S) as reply:
+            text = reply.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = MEMORY_IN_USE.search(text)
+    return round(int(found.group(1)) / BYTES_PER_GB, 2) if found else None
+
+
+def engine_memory_gb() -> float | None:
+    """Memory in use on the first ready engine, as last sampled by the background pass."""
+    with _ready_lock:
+        return next((state["memory_gb"] for state in _ready_engines.values()), None)
+
+
 def refresh_ready_engines(engines: dict[str, dict[str, str]] | None = None) -> None:
     """One pass: record which mapped models have an engine that is ready now, with its context size."""
     ready = {}
     for model, engine in (load_engines() if engines is None else engines).items():
         is_ready, context = _engine_context(engine)
         if is_ready:
-            ready[model] = context
+            ready[model] = {"context": context, "memory_gb": _engine_memory_gb(engine)}
     with _ready_lock:
         _ready_engines.clear()
         _ready_engines.update(ready)
@@ -243,7 +266,8 @@ def with_remote_model_loaded(snapshot: dict[str, Any]) -> dict[str, Any]:
         ready = dict(_ready_engines)
     if not ready:
         return snapshot
-    model, context = next(iter(ready.items()))
+    model, state = next(iter(ready.items()))
+    context = state["context"]
     limits = [limit for limit in (snapshot.get("configured_context_limit"), context) if limit]
     return {**snapshot, "loaded_model": model, "loaded_context_size": context,
             "effective_context_limit": min(limits) if limits else None}
@@ -277,7 +301,8 @@ def _hoist_timings(event: bytes) -> bytes:
     """Copy a Responses event's `response.timings` to the top level, where Nativ's client reads it.
 
     The bundled server puts speed figures on every event; Splash nests them in the final `response`,
-    so without this the app's prefill and decode pills fall back to rough estimates.
+    so without this the app's prefill and decode pills fall back to rough estimates. Splash reports no
+    per-reply peak memory, so the engine's memory in use stands in for it when known.
     """
     if b'"timings"' not in event:
         return event
@@ -292,7 +317,11 @@ def _hoist_timings(event: bytes) -> bytes:
         response = data.get("response") if isinstance(data, dict) else None
         if not isinstance(response, dict) or "timings" not in response or "timings" in data:
             return event
-        lines[index] = b"data: " + json.dumps({**data, "timings": response["timings"]}).encode()
+        timings = dict(response["timings"])
+        memory = engine_memory_gb()
+        if memory is not None:
+            timings.setdefault("peak_memory", memory)
+        lines[index] = b"data: " + json.dumps({**data, "timings": timings}).encode()
         return b"\n".join(lines)
     return event
 
