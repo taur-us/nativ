@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -32,7 +33,6 @@ from fastapi.responses import JSONResponse, Response
 from mlx.utils import tree_flatten
 
 import mlx_vlm.server as base
-import mlx_vlm.server.app as base_app
 import mlx_vlm.server.cli as base_cli
 import mlx_vlm.server.generation as base_generation
 import mlx_vlm.server.openai as base_openai
@@ -1530,6 +1530,8 @@ def install_metrics_overlay() -> None:
 
 def install_remote_engine_status() -> None:
     """Make /health report a ready externally served model as loaded, with the engine's context size."""
+    # The package's `app` attribute is the FastAPI instance, so a plain `import ... as` would not return the module.
+    base_app = importlib.import_module("mlx_vlm.server.app")
     in_process_snapshot = base_app._server_runtime_snapshot
     base_app._server_runtime_snapshot = lambda: remote_engine.with_remote_model_loaded(in_process_snapshot())
     remote_engine.start_status_refresher()
