@@ -14,6 +14,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
+import urllib.request
 from typing import Any, AsyncIterator, Iterator
 
 import httpx
@@ -42,7 +45,14 @@ SSE_EVENT_END = b"\n\n"
 # Message fields that carry the conversation; everything else Nativ adds is presentation data.
 CHAT_MESSAGE_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name")
 
+# How often a ready engine is re-checked, and how long one check may take; requests never wait on it.
+STATUS_REFRESH_S = 5
+STATUS_TIMEOUT_S = 2
+
 _client: httpx.AsyncClient | None = None
+_ready_engines: dict[str, int | None] = {}
+_ready_lock = threading.Lock()
+_refresher: threading.Thread | None = None
 
 
 def load_engines(path: str = ENGINES_PATH) -> dict[str, dict[str, str]]:
@@ -182,6 +192,61 @@ async def count_input_tokens(payload: dict[str, Any], engine: dict[str, str]) ->
         return JSONResponse({"input_tokens": len(counted.json()["tokens"])})
     except (httpx.HTTPError, KeyError, ValueError) as error:
         return _unavailable(error)
+
+
+def _engine_context(engine: dict[str, str]) -> tuple[bool, int | None]:
+    """Ask the engine's /status whether it is ready and how large a context it serves."""
+    root = engine["base_url"].rstrip("/").removesuffix("/v1")
+    request = urllib.request.Request(root + "/status", headers=_engine_headers(engine))
+    try:
+        with urllib.request.urlopen(request, timeout=STATUS_TIMEOUT_S) as reply:
+            status = json.load(reply)
+    except (OSError, ValueError):
+        return False, None
+    context = status.get("maximum_context_tokens") if isinstance(status, dict) else None
+    return bool(isinstance(status, dict) and status.get("ready")), context if isinstance(context, int) else None
+
+
+def refresh_ready_engines(engines: dict[str, dict[str, str]] | None = None) -> None:
+    """One pass: record which mapped models have an engine that is ready now, with its context size."""
+    ready = {}
+    for model, engine in (load_engines() if engines is None else engines).items():
+        is_ready, context = _engine_context(engine)
+        if is_ready:
+            ready[model] = context
+    with _ready_lock:
+        _ready_engines.clear()
+        _ready_engines.update(ready)
+
+
+def start_status_refresher() -> None:
+    """Keep the ready-engine record fresh in the background so status requests never block on an engine."""
+    global _refresher
+    if _refresher is not None:
+        return
+
+    def loop() -> None:
+        while True:
+            refresh_ready_engines()
+            time.sleep(STATUS_REFRESH_S)
+
+    _refresher = threading.Thread(target=loop, name="nativ-remote-engine-status", daemon=True)
+    _refresher.start()
+
+
+def with_remote_model_loaded(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Report a ready externally served model as the loaded one when nothing is loaded in-process, so the
+    app shows it as available and sizes its context limit (and so its compaction threshold) from the engine."""
+    if snapshot.get("loaded_model"):
+        return snapshot
+    with _ready_lock:
+        ready = dict(_ready_engines)
+    if not ready:
+        return snapshot
+    model, context = next(iter(ready.items()))
+    limits = [limit for limit in (snapshot.get("configured_context_limit"), context) if limit]
+    return {**snapshot, "loaded_model": model, "loaded_context_size": context,
+            "effective_context_limit": min(limits) if limits else None}
 
 
 def _http_client() -> httpx.AsyncClient:
