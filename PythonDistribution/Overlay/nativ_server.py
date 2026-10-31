@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, Response
 from mlx.utils import tree_flatten
 
 import mlx_vlm.server as base
+import mlx_vlm.server.app as base_app
 import mlx_vlm.server.cli as base_cli
 import mlx_vlm.server.generation as base_generation
 import mlx_vlm.server.openai as base_openai
@@ -964,7 +965,7 @@ def current_runtime_snapshot() -> dict[str, Any]:
     else:
         apc_snapshot = {"enabled": False}
 
-    return {
+    return remote_engine.with_remote_model_loaded({
         "loaded_model": base.model_cache.get("model_path") if isinstance(base.model_cache, dict) else None,
         "loaded_adapter": base.model_cache.get("adapter_path") if isinstance(base.model_cache, dict) else None,
         "loaded_context_size": loaded_context_size,
@@ -975,7 +976,7 @@ def current_runtime_snapshot() -> dict[str, Any]:
         "continuous_batching_enabled": getattr(base, "response_generator", None) is not None,
         "request_queue_depth": queue_depth,
         "apc": apc_snapshot,
-    }
+    })
 
 
 class StreamAccumulator:
@@ -1527,8 +1528,16 @@ def install_metrics_overlay() -> None:
         return {"status": "queued", "routine_id": routine_id}
 
 
+def install_remote_engine_status() -> None:
+    """Make /health report a ready externally served model as loaded, with the engine's context size."""
+    in_process_snapshot = base_app._server_runtime_snapshot
+    base_app._server_runtime_snapshot = lambda: remote_engine.with_remote_model_loaded(in_process_snapshot())
+    remote_engine.start_status_refresher()
+
+
 def main() -> None:
     sys.argv[1:] = remote_engine.without_remote_preload(sys.argv[1:], remote_engine.load_engines())
+    install_remote_engine_status()
     install_metrics_overlay()
     install_metrics_access_log_filter()
     original_argparse = base_cli.argparse

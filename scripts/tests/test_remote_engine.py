@@ -403,5 +403,76 @@ class ForwardTests(unittest.TestCase):
         self.assertEqual(StubClient.sent, [])
 
 
+class StatusReply:
+    """What urllib's urlopen returns: a context manager that json.load can read."""
+
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, *args):
+        return self._body
+
+
+class RemoteModelStatusTests(unittest.TestCase):
+    ENGINES = {"qwen": {"base_url": "http://127.0.0.1:8091/v1"}}
+
+    def setUp(self):
+        self.module = load_module()
+
+    def refresh(self, reply):
+        with patch.object(self.module.urllib.request, "urlopen", side_effect=reply if isinstance(reply, Exception) else None,
+                          return_value=None if isinstance(reply, Exception) else StatusReply(reply)) as opened:
+            self.module.refresh_ready_engines(self.ENGINES)
+        return opened
+
+    def test_a_ready_engine_is_reported_as_the_loaded_model_with_its_context(self):
+        self.refresh(b'{"ready": true, "maximum_context_tokens": 262144}')
+        shown = self.module.with_remote_model_loaded({"loaded_model": None, "configured_context_limit": None})
+        self.assertEqual(shown["loaded_model"], "qwen")
+        self.assertEqual(shown["loaded_context_size"], 262144)
+        self.assertEqual(shown["effective_context_limit"], 262144)
+
+    def test_the_status_is_read_from_the_engine_root_not_its_v1_path(self):
+        opened = self.refresh(b'{"ready": true}')
+        self.assertEqual(opened.call_args.args[0].full_url, "http://127.0.0.1:8091/status")
+
+    def test_a_configured_limit_below_the_engine_context_wins(self):
+        self.refresh(b'{"ready": true, "maximum_context_tokens": 262144}')
+        shown = self.module.with_remote_model_loaded({"loaded_model": None, "configured_context_limit": 65536})
+        self.assertEqual(shown["effective_context_limit"], 65536)
+
+    def test_a_model_loaded_in_process_is_never_replaced(self):
+        self.refresh(b'{"ready": true, "maximum_context_tokens": 262144}')
+        snapshot = {"loaded_model": "in-process", "effective_context_limit": 4096}
+        self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
+
+    def test_an_engine_that_is_not_ready_leaves_the_snapshot_alone(self):
+        self.refresh(b'{"ready": false, "maximum_context_tokens": 262144}')
+        snapshot = {"loaded_model": None}
+        self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
+
+    def test_an_unreachable_engine_leaves_the_snapshot_alone(self):
+        self.refresh(OSError("connection refused"))
+        snapshot = {"loaded_model": None}
+        self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
+
+    def test_a_garbled_status_leaves_the_snapshot_alone(self):
+        self.refresh(b"<html>")
+        snapshot = {"loaded_model": None}
+        self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
+
+    def test_an_engine_that_goes_away_is_forgotten_on_the_next_pass(self):
+        self.refresh(b'{"ready": true}')
+        self.refresh(OSError("gone"))
+        snapshot = {"loaded_model": None}
+        self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
+
+
 if __name__ == "__main__":
     unittest.main()
