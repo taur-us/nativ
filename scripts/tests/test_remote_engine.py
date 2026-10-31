@@ -534,6 +534,15 @@ def history():
     ]
 
 
+def chat_history():
+    """Long text-only turns: there is no tool output to clear, so shrinking it needs a summary."""
+    turns = []
+    for number in range(4):
+        turns.append({"type": "message", "role": "user", "content": f"question {number} " + "q" * 3000})
+        turns.append({"type": "message", "role": "assistant", "content": f"answer {number} " + "a" * 3000})
+    return turns + [{"type": "message", "role": "user", "content": "latest"}]
+
+
 def completed_event(tokens, output=None):
     data = {"type": "response.completed", "response": {"output": output or [], "usage": {"input_tokens": tokens}}}
     return b"event: response.completed\ndata: " + json.dumps(data).encode()
@@ -544,8 +553,8 @@ class CompactionTests(unittest.TestCase):
         self.module = load_module()
         StubClient.posted, StubClient.post_script = [], []
 
-    def compact(self, tokens=1000, threshold=500, body=None):
-        body = body or {"model": "m", "input": history(), "tools": [], "tool_choice": "auto", "stream": True}
+    def compact(self, tokens=1000, threshold=500, body=None, items=None):
+        body = body or {"model": "m", "input": items or chat_history(), "tools": [], "tool_choice": "auto", "stream": True}
         return asyncio.run(self.module.compaction_item(
             StubClient(), "http://engine/v1/responses", {}, body, threshold, {"usage": {"input_tokens": tokens}}))
 
@@ -604,7 +613,7 @@ class CompactionTests(unittest.TestCase):
         StubClient.post_script = [summary_reply()]
         self.assertIsNotNone(self.compact(tokens=500))
         sent = StubClient.posted[0].json
-        self.assertEqual(sent["input"][:-1], history())
+        self.assertEqual(sent["input"][:-1], chat_history())
         self.assertEqual(sent["input"][-1]["content"], self.module.SUMMARY_INSTRUCTION)
         self.assertIs(sent["stream"], False)
         self.assertNotIn("tool_choice", sent)
@@ -612,9 +621,12 @@ class CompactionTests(unittest.TestCase):
     def test_the_sealed_result_expands_to_the_task_the_summary_and_the_recent_tail(self):
         StubClient.post_script = [summary_reply("THE HANDOFF")]
         expanded = self.module.expand_compaction([self.compact()])
-        self.assertEqual(expanded[0], history()[0])
-        self.assertIn("THE HANDOFF", expanded[1]["content"][0]["text"])
-        self.assertEqual(expanded[2:], history()[4:])
+        source = chat_history()
+        handoff = next(i for i, item in enumerate(expanded) if isinstance(item["content"], list))
+        self.assertIn("THE HANDOFF", expanded[handoff]["content"][0]["text"])
+        self.assertEqual(expanded[0], source[0])
+        self.assertEqual(expanded[handoff + 1:], source[-1:])
+        self.assertLess(len(expanded), len(source))
 
     def test_an_empty_summary_or_an_engine_error_leaves_the_conversation_alone(self):
         for step in (summary_reply("  "), JSONReply({}, error=StubHTTPError("down")), JSONReply({"output": []})):
@@ -624,6 +636,27 @@ class CompactionTests(unittest.TestCase):
     def test_a_summary_that_would_not_shrink_the_context_is_discarded(self):
         StubClient.post_script = [summary_reply("y" * 50000)]
         self.assertIsNone(self.compact())
+
+    def test_old_tool_output_is_cleared_first_without_asking_the_engine(self):
+        item = self.compact(items=history())
+        cleared = self.module.expand_compaction([item])
+        self.assertEqual(StubClient.posted, [])
+        self.assertEqual(cleared[2]["output"], self.module.CLEARED_OUTPUT)
+        self.assertEqual(cleared[6], history()[6])
+        self.assertEqual([i.get("content") for i in cleared if i.get("type") == "message"],
+                         [i.get("content") for i in history() if i.get("type") == "message"])
+
+    def test_clearing_keeps_every_call_and_the_recent_tail_verbatim(self):
+        items = history()
+        cleared = self.module.clear_old_outputs(items, 4)
+        self.assertEqual([i["call_id"] for i in cleared if i["type"] == "function_call"], ["c1", "c2"])
+        self.assertEqual(cleared[4:], items[4:])
+        self.assertEqual(cleared[2]["output"], self.module.CLEARED_OUTPUT)
+
+    def test_when_clearing_is_not_enough_the_engine_is_asked_for_a_summary(self):
+        StubClient.post_script = [summary_reply()]
+        self.assertIsNotNone(self.compact())
+        self.assertEqual(len(StubClient.posted), 1)
 
     def test_only_the_completed_event_gets_the_item(self):
         async def compact(response):
