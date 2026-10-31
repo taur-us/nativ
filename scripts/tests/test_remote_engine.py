@@ -517,5 +517,189 @@ class RemoteModelStatusTests(unittest.TestCase):
         self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
 
 
+def summary_reply(text="SUM"):
+    return JSONReply({"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]})
+
+
+def history():
+    """A user task, a long early tool exchange, then a short recent exchange."""
+    return [
+        {"type": "message", "role": "user", "content": "task"},
+        {"type": "function_call", "call_id": "c1", "name": "read_file", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "x" * 5000},
+        {"type": "message", "role": "assistant", "content": "noted"},
+        {"type": "message", "role": "user", "content": "next"},
+        {"type": "function_call", "call_id": "c2", "name": "read_file", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c2", "output": "short"},
+    ]
+
+
+def completed_event(tokens, output=None):
+    data = {"type": "response.completed", "response": {"output": output or [], "usage": {"input_tokens": tokens}}}
+    return b"event: response.completed\ndata: " + json.dumps(data).encode()
+
+
+class CompactionTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+        StubClient.posted, StubClient.post_script = [], []
+
+    def compact(self, tokens=1000, threshold=500, body=None):
+        body = body or {"model": "m", "input": history(), "tools": [], "tool_choice": "auto", "stream": True}
+        return asyncio.run(self.module.compaction_item(
+            StubClient(), "http://engine/v1/responses", {}, body, threshold, {"usage": {"input_tokens": tokens}}))
+
+    def test_the_threshold_is_read_from_the_apps_context_management(self):
+        read = self.module.compaction_threshold
+        self.assertEqual(read({"context_management": [{"type": "compaction", "compact_threshold": 196608}]}), 196608)
+        for payload in ({}, {"context_management": []}, {"context_management": "x"},
+                        {"context_management": [{"type": "other", "compact_threshold": 5}]},
+                        {"context_management": [{"type": "compaction", "compact_threshold": 0}]},
+                        {"context_management": [{"type": "compaction", "compact_threshold": "9"}]}):
+            self.assertIsNone(read(payload))
+
+    def test_a_sealed_item_expands_back_to_its_context_and_replaces_what_came_before(self):
+        carried = [{"type": "message", "role": "user", "content": "kept"}]
+        item = self.module.seal_compaction(carried)
+        later = {"type": "message", "role": "user", "content": "later"}
+        expanded = self.module.expand_compaction([{"type": "message", "role": "user", "content": "old"}, item, later])
+        self.assertEqual(expanded, carried + [later])
+
+    def test_input_without_a_compaction_item_is_unchanged(self):
+        items = history()
+        self.assertEqual(self.module.expand_compaction(items), items)
+
+    def test_a_foreign_or_damaged_compaction_item_is_refused(self):
+        for content in ("opaque-from-another-server", self.module.CAPSULE_PREFIX + "{not json",
+                        self.module.CAPSULE_PREFIX + '{"items": 5}', None):
+            with self.assertRaises(ValueError):
+                self.module.expand_compaction([{"type": "compaction", "encrypted_content": content}])
+
+    def test_the_cut_keeps_the_final_group_and_as_many_earlier_ones_as_fit(self):
+        items = history()
+        self.assertEqual(self.module.choose_cut(items, 125, 0.185), 4)
+        self.assertEqual(self.module.choose_cut(items, 0, 0.185), 5)
+
+    def test_a_conversation_with_nothing_before_its_final_group_is_not_cut(self):
+        self.assertEqual(self.module.choose_cut(history()[:1], 125, 0.185), 0)
+
+    def test_the_compacted_context_is_anchors_then_handoff_then_the_tail(self):
+        items = history()
+        compacted = self.module.compacted_items(items, " the summary ", 4)
+        self.assertEqual(compacted[0], items[0])
+        self.assertIn("the summary", compacted[1]["content"][0]["text"])
+        self.assertEqual(compacted[2:], items[4:])
+
+    def test_the_first_and_latest_user_messages_before_the_cut_are_both_kept_once(self):
+        items = history()
+        self.assertEqual(self.module.compacted_items(items, "s", 5)[:2], [items[0], items[4]])
+        self.assertEqual(self.module.compacted_items(items, "s", 2)[0], items[0])
+        self.assertEqual(len([i for i in self.module.compacted_items(items, "s", 2) if i is items[0]]), 1)
+
+    def test_below_the_threshold_nothing_is_compacted_and_the_engine_is_not_asked(self):
+        self.assertIsNone(self.compact(tokens=100))
+        self.assertEqual(StubClient.posted, [])
+
+    def test_at_the_threshold_the_prompt_just_answered_plus_one_instruction_is_sent(self):
+        StubClient.post_script = [summary_reply()]
+        self.assertIsNotNone(self.compact(tokens=500))
+        sent = StubClient.posted[0].json
+        self.assertEqual(sent["input"][:-1], history())
+        self.assertEqual(sent["input"][-1]["content"], self.module.SUMMARY_INSTRUCTION)
+        self.assertIs(sent["stream"], False)
+        self.assertNotIn("tool_choice", sent)
+
+    def test_the_sealed_result_expands_to_the_task_the_summary_and_the_recent_tail(self):
+        StubClient.post_script = [summary_reply("THE HANDOFF")]
+        expanded = self.module.expand_compaction([self.compact()])
+        self.assertEqual(expanded[0], history()[0])
+        self.assertIn("THE HANDOFF", expanded[1]["content"][0]["text"])
+        self.assertEqual(expanded[2:], history()[4:])
+
+    def test_an_empty_summary_or_an_engine_error_leaves_the_conversation_alone(self):
+        for step in (summary_reply("  "), JSONReply({}, error=StubHTTPError("down")), JSONReply({"output": []})):
+            StubClient.post_script = [step]
+            self.assertIsNone(self.compact())
+
+    def test_a_summary_that_would_not_shrink_the_context_is_discarded(self):
+        StubClient.post_script = [summary_reply("y" * 50000)]
+        self.assertIsNone(self.compact())
+
+    def test_only_the_completed_event_gets_the_item(self):
+        async def compact(response):
+            return {"type": "compaction", "id": "cmp_1"}
+        add = lambda event, fn=compact: asyncio.run(self.module._with_compaction(event, fn))
+        output = json.loads(add(completed_event(9, [{"type": "message"}])).split(b"data: ")[1])["response"]["output"]
+        self.assertEqual([item["type"] for item in output], ["message", "compaction"])
+        delta = b'event: response.output_text.delta\ndata: {"type": "response.output_text.delta", "delta": "hi"}'
+        self.assertEqual(add(delta), delta)
+        self.assertEqual(add(completed_event(9), None), completed_event(9))
+
+    def test_a_declined_compaction_leaves_the_final_event_byte_identical(self):
+        async def decline(response):
+            return None
+        event = completed_event(9)
+        self.assertEqual(asyncio.run(self.module._with_compaction(event, decline)), event)
+
+
+class CompactionForwardTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+        StubClient.sent, StubClient.script, StubClient.posted, StubClient.post_script = [], [], [], []
+        self.request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+
+    def payload(self, **extra):
+        return {"model": "qwen", "stream": True, "input": history(),
+                "context_management": [{"type": "compaction", "compact_threshold": 500}], **extra}
+
+    def forward(self, payload):
+        return asyncio.run(self.module.forward(self.request, payload, ENGINE))
+
+    def collect(self, response):
+        async def gather():
+            return [chunk async for chunk in response.content]
+        return b"".join(asyncio.run(gather()))
+
+    def test_the_apps_compaction_request_is_not_passed_to_the_engine(self):
+        StubClient.script = [UpstreamResponse(content_type="text/event-stream", chunks=[b"data: [DONE]\n\n"])]
+        self.collect(self.forward(self.payload()))
+        self.assertNotIn("context_management", StubClient.sent[0].json)
+
+    def test_a_stream_past_the_threshold_ends_with_a_compaction_item(self):
+        StubClient.script = [UpstreamResponse(content_type="text/event-stream",
+                                              chunks=[completed_event(1000) + b"\n\n"])]
+        StubClient.post_script = [summary_reply()]
+        body = self.collect(self.forward(self.payload()))
+        output = json.loads(body.split(b"data: ")[1])["response"]["output"]
+        self.assertEqual(output[-1]["type"], "compaction")
+        self.assertTrue(output[-1]["encrypted_content"].startswith(self.module.CAPSULE_PREFIX))
+
+    def test_a_stream_under_the_threshold_is_relayed_unchanged_and_never_summarised(self):
+        event = completed_event(100) + b"\n\n"
+        StubClient.script = [UpstreamResponse(content_type="text/event-stream", chunks=[event])]
+        self.assertEqual(self.collect(self.forward(self.payload())), event)
+        self.assertEqual(StubClient.posted, [])
+
+    def test_a_buffered_answer_past_the_threshold_gets_the_item_too(self):
+        answer = {"output": [], "usage": {"input_tokens": 1000}}
+        StubClient.script = [UpstreamResponse(body=json.dumps(answer).encode())]
+        StubClient.post_script = [summary_reply()]
+        response = self.forward(self.payload(stream=False))
+        self.assertEqual(json.loads(response.content)["output"][-1]["type"], "compaction")
+
+    def test_a_stored_compaction_item_is_expanded_before_the_engine_sees_the_input(self):
+        item = self.module.seal_compaction([{"type": "message", "role": "user", "content": "carried"}])
+        newer = {"type": "message", "role": "user", "content": "newer"}
+        StubClient.script = [UpstreamResponse()]
+        self.forward(self.payload(stream=False, input=[item, newer], context_management=None))
+        self.assertEqual([i["content"] for i in StubClient.sent[0].json["input"]], ["carried", "newer"])
+
+    def test_a_compaction_item_from_elsewhere_is_a_400_and_never_reaches_the_engine(self):
+        bad = {"type": "compaction", "encrypted_content": "from-another-server"}
+        response = self.forward(self.payload(input=[bad]))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(StubClient.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main()
