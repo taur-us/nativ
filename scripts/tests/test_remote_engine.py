@@ -578,11 +578,14 @@ class CompactionTests(unittest.TestCase):
         items = history()
         self.assertEqual(self.module.expand_compaction(items), items)
 
-    def test_a_foreign_or_damaged_compaction_item_is_refused(self):
+    def test_a_foreign_or_damaged_compaction_item_becomes_a_note_not_an_error(self):
+        later = {"type": "message", "role": "user", "content": "later"}
         for content in ("opaque-from-another-server", self.module.CAPSULE_PREFIX + "{not json",
                         self.module.CAPSULE_PREFIX + '{"items": 5}', None):
-            with self.assertRaises(ValueError):
-                self.module.expand_compaction([{"type": "compaction", "encrypted_content": content}])
+            expanded = self.module.expand_compaction([{"type": "compaction", "encrypted_content": content}, later])
+            self.assertEqual(len(expanded), 2)
+            self.assertEqual(expanded[-1], later)
+            self.assertIn("compacted", expanded[0]["content"])
 
     def test_the_cut_keeps_the_final_group_and_as_many_earlier_ones_as_fit(self):
         items = history()
@@ -682,7 +685,7 @@ class CompactionForwardTests(unittest.TestCase):
         self.request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
 
     def payload(self, **extra):
-        return {"model": "qwen", "stream": True, "input": history(),
+        return {"model": "qwen", "stream": True, "input": chat_history(),
                 "context_management": [{"type": "compaction", "compact_threshold": 500}], **extra}
 
     def forward(self, payload):
@@ -704,6 +707,7 @@ class CompactionForwardTests(unittest.TestCase):
         StubClient.post_script = [summary_reply()]
         body = self.collect(self.forward(self.payload()))
         output = json.loads(body.split(b"data: ")[1])["response"]["output"]
+        self.assertEqual(len(StubClient.posted), 1)
         self.assertEqual(output[-1]["type"], "compaction")
         self.assertTrue(output[-1]["encrypted_content"].startswith(self.module.CAPSULE_PREFIX))
 
@@ -718,6 +722,7 @@ class CompactionForwardTests(unittest.TestCase):
         StubClient.script = [UpstreamResponse(body=json.dumps(answer).encode())]
         StubClient.post_script = [summary_reply()]
         response = self.forward(self.payload(stream=False))
+        self.assertEqual(len(StubClient.posted), 1)
         self.assertEqual(json.loads(response.content)["output"][-1]["type"], "compaction")
 
     def test_a_stored_compaction_item_is_expanded_before_the_engine_sees_the_input(self):
@@ -727,11 +732,148 @@ class CompactionForwardTests(unittest.TestCase):
         self.forward(self.payload(stream=False, input=[item, newer], context_management=None))
         self.assertEqual([i["content"] for i in StubClient.sent[0].json["input"]], ["carried", "newer"])
 
-    def test_a_compaction_item_from_elsewhere_is_a_400_and_never_reaches_the_engine(self):
+    def test_a_compaction_item_from_elsewhere_does_not_stick_the_chat(self):
         bad = {"type": "compaction", "encrypted_content": "from-another-server"}
-        response = self.forward(self.payload(input=[bad]))
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(StubClient.sent, [])
+        newer = {"type": "message", "role": "user", "content": "newer"}
+        StubClient.script = [UpstreamResponse()]
+        self.forward(self.payload(stream=False, input=[bad, newer], context_management=None))
+        self.assertEqual(StubClient.sent[0].json["input"][-1]["content"], "newer")
+
+
+class CompactionRobustnessTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+        StubClient.posted, StubClient.post_script = [], []
+
+    def compaction_item(self, body, tokens=1000, threshold=500):
+        return asyncio.run(self.module.compaction_item(
+            StubClient(), "http://engine/v1/responses", {}, body, threshold, {"usage": {"input_tokens": tokens}}))
+
+    def test_tool_calls_and_outputs_kept_in_a_capsule_are_counted_as_chat_messages(self):
+        carried = [{"type": "message", "role": "user", "content": "task"},
+                   {"type": "function_call", "call_id": "c1", "name": "read_file", "arguments": '{"path": "a"}'},
+                   {"type": "function_call_output", "call_id": "c1", "output": "BODY"}]
+        payload = {"model": "qwen", "input": [self.module.seal_compaction(carried),
+                                              {"type": "message", "role": "user", "content": "hi"}]}
+        StubClient.post_script = [JSONReply({"prompt": "p"}), JSONReply({"tokens": [1]})]
+        asyncio.run(self.module.count_input_tokens(payload, ENGINE))
+        messages = StubClient.posted[0].json["messages"]
+        self.assertTrue(all(m.get("role") for m in messages))
+        call = next(m for m in messages if m.get("tool_calls"))
+        self.assertEqual(call["tool_calls"][0]["function"]["name"], "read_file")
+        self.assertEqual(next(m for m in messages if m["role"] == "tool")["content"], "BODY")
+
+    def test_a_compaction_that_raises_never_costs_the_reply(self):
+        async def broken(response):
+            raise RuntimeError("boom")
+        event = completed_event(9)
+        self.assertEqual(asyncio.run(self.module._with_compaction(event, broken)), event)
+
+    def test_odd_requests_decline_instead_of_raising(self):
+        for body in ({"model": "m"}, {"model": "m", "input": ["x", {"type": "function_call"}]}):
+            StubClient.post_script = [summary_reply()]
+            self.assertIsNone(self.compaction_item(body))
+        StubClient.post_script = [JSONReply({"output": [{"type": "message", "content": None}]})]
+        self.assertIsNone(self.compaction_item({"model": "m", "input": chat_history()}))
+
+    def test_a_chat_stored_with_a_foreign_capsule_can_still_be_counted(self):
+        foreign = {"type": "compaction", "encrypted_content": "from-another-server"}
+        StubClient.post_script = [JSONReply({"prompt": "p"}), JSONReply({"tokens": [1, 2]})]
+        reply = asyncio.run(self.module.count_input_tokens({"model": "qwen", "input": [foreign]}, ENGINE))
+        self.assertEqual(reply.content, {"input_tokens": 2})
+
+    def test_a_truncated_summary_is_not_sealed(self):
+        StubClient.post_script = [JSONReply({"status": "incomplete", "output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "half a handoff"}]}]})]
+        self.assertIsNone(self.compaction_item({"model": "m", "input": chat_history()}))
+
+    def test_the_summary_request_drops_output_format_fields_and_stays_inside_the_threshold(self):
+        StubClient.post_script = [summary_reply()]
+        body = {"model": "m", "input": chat_history(), "text": {"format": {"type": "json_schema"}},
+                "response_format": {"type": "json_object"}}
+        self.compaction_item(body)
+        sent = StubClient.posted[0].json
+        self.assertNotIn("text", sent)
+        self.assertNotIn("response_format", sent)
+        self.assertLessEqual(sent["max_output_tokens"], 50)
+
+    def test_a_cut_never_separates_a_call_from_its_output_even_when_calls_are_not_adjacent(self):
+        items = [{"type": "message", "role": "user", "content": "go"},
+                 {"type": "function_call", "call_id": "a", "name": "f", "arguments": "{}"},
+                 {"type": "message", "role": "assistant", "content": "thinking"},
+                 {"type": "function_call", "call_id": "b", "name": "f", "arguments": "{}"},
+                 {"type": "function_call_output", "call_id": "a", "output": "A" * 40},
+                 {"type": "function_call_output", "call_id": "b", "output": "B" * 40},
+                 {"type": "message", "role": "user", "content": "next"},
+                 {"type": "message", "role": "assistant", "content": "ok"}]
+        for budget in (0, len(json.dumps(items[3:])) + 1, 10 ** 6):
+            tail = items[self.module.choose_cut(items, budget, 1.0):]
+            calls = {i["call_id"] for i in tail if i.get("type") == "function_call"}
+            self.assertTrue(all(i["call_id"] in calls for i in tail if i.get("type") == "function_call_output"))
+
+    def test_the_final_event_gets_compaction_even_without_a_trailing_blank_line(self):
+        async def compact(response):
+            return {"type": "compaction", "id": "cmp_1"}
+        upstream = UpstreamResponse(content_type="text/event-stream", chunks=[completed_event(9)])
+
+        async def gather():
+            return [chunk async for chunk in self.module._relay_responses_and_close(upstream, compact)]
+        self.assertIn(b'"compaction"', b"".join(asyncio.run(gather())))
+
+    def test_timings_that_are_not_a_mapping_leave_the_event_unchanged(self):
+        event = b'data: {"response": {"timings": null}}'
+        self.assertEqual(self.module._hoist_timings(event), event)
+
+    def test_a_second_compaction_replaces_the_first_handoff_instead_of_stacking_it(self):
+        StubClient.post_script = [summary_reply("FIRST")]
+        first = self.compaction_item({"model": "m", "input": chat_history()})
+        expanded = self.module.expand_compaction([first] + chat_history())
+        StubClient.post_script = [summary_reply("SECOND")]
+        second = self.compaction_item({"model": "m", "input": expanded})
+        carried = self.module.expand_compaction([second])
+        handoffs = [i for i in carried if isinstance(i.get("content"), list) and "handoff" in json.dumps(i["content"]).lower()]
+        self.assertEqual(len(handoffs), 1)
+        self.assertIn("SECOND", json.dumps(handoffs[0]))
+        self.assertIn("FIRST", json.dumps(StubClient.posted[1].json["input"]))
+
+
+class EngineStatusRobustnessTests(unittest.TestCase):
+    ENGINES = {"a": {"base_url": "http://a:1/v1"}, "b": {"base_url": "http://b:1/v1"}}
+
+    def setUp(self):
+        self.module = load_module()
+
+    def refresh(self, metrics_by_host):
+        def reply(request, timeout=None):
+            host = request.full_url.split("//")[1].split(":")[0]
+            if request.full_url.endswith("/metrics"):
+                return StatusReply(metrics_by_host[host])
+            return StatusReply(b'{"ready": true}')
+        with patch.object(self.module.urllib.request, "urlopen", side_effect=reply):
+            self.module.refresh_ready_engines(self.ENGINES)
+
+    def test_a_malformed_http_reply_counts_as_not_ready_and_does_not_raise(self):
+        # the module under test's own http.client: the loader restores sys.modules, so a fresh import would be a different class
+        with patch.object(self.module.urllib.request, "urlopen", side_effect=self.module.http.client.BadStatusLine("x")):
+            self.module.refresh_ready_engines(self.ENGINES)
+        self.assertIsNone(self.module.with_remote_model_loaded({"loaded_model": None}).get("loaded_model"))
+
+    def test_memory_in_float_or_exponent_form_is_read(self):
+        for text, expected in ((b"splash_memory_current_bytes 1.7e+10\n", 17.0), (b"splash_memory_current_bytes 123000000000.0\n", 123.0)):
+            self.refresh({"a": text, "b": text})
+            self.assertEqual(self.module.engine_memory_gb("a"), expected)
+
+    def test_the_memory_reported_is_that_of_the_engine_serving_the_request(self):
+        self.refresh({"a": b"splash_memory_current_bytes 10000000000\n", "b": b"splash_memory_current_bytes 20000000000\n"})
+        event = b'data: {"response": {"timings": {"predicted_per_second": 1}}}'
+        for model, expected in (("a", 10.0), ("b", 20.0)):
+            timings = json.loads(self.module._hoist_timings(event, model).split(b"data: ")[1])["timings"]
+            self.assertEqual(timings["peak_memory"], expected)
+
+    def test_the_refresh_loop_survives_an_unexpected_error(self):
+        with patch.object(self.module, "refresh_ready_engines", side_effect=RuntimeError("boom")) as refresh:
+            self.module.refresh_once()
+        self.assertEqual(refresh.call_count, 1)
 
 
 if __name__ == "__main__":

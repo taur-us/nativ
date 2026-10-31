@@ -64,6 +64,10 @@ as before. The file is read per request, so edits apply without a restart.
 - While an engine's `/status` reports it ready, `/health` and `/metrics` show the listed model as loaded
   with the engine's context size, so the app sizes its compaction threshold from it. The engine's
   `/metrics` memory in use is passed to the app as the peak-memory figure (the engine has no per-reply peak).
+  Only the first ready engine is reported as loaded, and nothing is reported while a model is loaded
+  in-process, so with several engines or a mixed setup the app may size its threshold from another model's
+  context. A chat whose stored compaction item came from another server (for example an in-process
+  compaction made before the model was listed here) carries on without it, with a note saying so.
 - A listed model is never preloaded in-process, even when it is the active model.
 - Model-load settings such as KV-cache bits, prefix caching, and draft models belong to the engine and
   have no effect on a forwarded model.
