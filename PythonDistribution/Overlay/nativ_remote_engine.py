@@ -11,6 +11,7 @@ The engines file maps a Nativ model id to its engine:
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -53,6 +54,12 @@ CHARS_PER_TOKEN = 3.2
 TAIL_FRACTION = 0.25
 SUMMARY_MAX_TOKENS = 6000
 HANDOFF_HEADING = "Conversation handoff:\n"
+# Stands in for a stored compaction item this server did not make (another engine, or an older build).
+UNAVAILABLE_NOTE = "[An earlier part of this conversation was compacted by a different server and is not available here.]"
+# Long base64 payloads (images) would otherwise swamp the characters-per-token ratio.
+DATA_URL = re.compile(r'data:[^"\\]{200,}')
+# The summary may use at most this share of the threshold as output, so its request cannot overflow the window.
+SUMMARY_OUTPUT_SHARE = 0.1
 # Old tool output is cleared first; a summary is only made when that alone leaves the context this share of the threshold or more.
 CLEARED_OUTPUT = "[Old tool result content cleared]"
 CLEAR_TARGET = 0.6
@@ -69,7 +76,7 @@ Keep the handoff short; use compact bullets. Return only the handoff, without re
 CHAT_MESSAGE_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name")
 
 # Splash exposes engine-wide memory in use; it reports no per-reply peak, so this stands in for the app's peak figure.
-MEMORY_IN_USE = re.compile(r"^splash_memory_current_bytes\s+(\d+)", re.M)
+MEMORY_IN_USE = re.compile(r"^splash_memory_current_bytes\s+([0-9.eE+-]+)", re.M)
 BYTES_PER_GB = 1e9
 # How often a ready engine is re-checked, and how long one check may take; requests never wait on it.
 STATUS_REFRESH_S = 5
@@ -189,14 +196,31 @@ def _engine_headers(engine: dict[str, str]) -> dict[str, str]:
     return {"authorization": f"Bearer {engine['api_key']}"} if engine.get("api_key") else {}
 
 
+def _chat_message(item: dict[str, Any]) -> dict[str, Any] | None:
+    """One input item as the chat message the engine's template expects; None for items that are not conversation."""
+    kind = item.get("type")
+    if kind == "function_call":
+        return {"role": "assistant", "content": "", "tool_calls": [
+            {"id": item.get("call_id"), "type": "function",
+             "function": {"name": item.get("name"), "arguments": item.get("arguments") or "{}"}}]}
+    if kind == "function_call_output":
+        output = item.get("output")
+        return {"role": "tool", "tool_call_id": item.get("call_id"), "content": output if isinstance(output, str) else json.dumps(output)}
+    message = {key: item[key] for key in CHAT_MESSAGE_KEYS if key in item}
+    if isinstance(message.get("content"), list):
+        message["content"] = "".join(part.get("text", "") for part in message["content"] if isinstance(part, dict))
+    return message if "role" in message else None
+
+
 def _count_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """The conversation of a Responses request as Chat-style messages, instructions first."""
     messages: list[dict[str, Any]] = []
     if payload.get("instructions"):
         messages.append({"role": "system", "content": payload["instructions"]})
     for item in expand_compaction(payload.get("input") or []):
-        if isinstance(item, dict):
-            messages.append({key: item[key] for key in CHAT_MESSAGE_KEYS if key in item})
+        message = _chat_message(item) if isinstance(item, dict) else None
+        if message is not None:
+            messages.append(message)
     return messages
 
 
@@ -227,7 +251,7 @@ def _engine_context(engine: dict[str, str]) -> tuple[bool, int | None]:
     try:
         with urllib.request.urlopen(request, timeout=STATUS_TIMEOUT_S) as reply:
             status = json.load(reply)
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return False, None
     context = status.get("maximum_context_tokens") if isinstance(status, dict) else None
     return bool(isinstance(status, dict) and status.get("ready")), context if isinstance(context, int) else None
@@ -240,16 +264,20 @@ def _engine_memory_gb(engine: dict[str, str]) -> float | None:
     try:
         with urllib.request.urlopen(request, timeout=STATUS_TIMEOUT_S) as reply:
             text = reply.read().decode("utf-8", "replace")
-    except OSError:
+    except (OSError, http.client.HTTPException):
         return None
     found = MEMORY_IN_USE.search(text)
-    return round(int(found.group(1)) / BYTES_PER_GB, 2) if found else None
+    try:
+        return round(float(found.group(1)) / BYTES_PER_GB, 2) if found else None
+    except ValueError:
+        return None
 
 
-def engine_memory_gb() -> float | None:
-    """Memory in use on the first ready engine, as last sampled by the background pass."""
+def engine_memory_gb(model: str | None = None) -> float | None:
+    """Memory in use on the engine serving `model` (the first ready engine when none is named), as last sampled."""
     with _ready_lock:
-        return next((state["memory_gb"] for state in _ready_engines.values()), None)
+        state = _ready_engines.get(model) if model is not None else next(iter(_ready_engines.values()), None)
+    return state["memory_gb"] if state else None
 
 
 def refresh_ready_engines(engines: dict[str, dict[str, str]] | None = None) -> None:
@@ -264,6 +292,14 @@ def refresh_ready_engines(engines: dict[str, dict[str, str]] | None = None) -> N
         _ready_engines.update(ready)
 
 
+def refresh_once() -> None:
+    """One refresh pass that never raises, so an unexpected reply cannot end the background loop."""
+    try:
+        refresh_ready_engines()
+    except Exception:  # the loop must outlive any one bad pass; the failure is logged
+        log.exception("remote engine status refresh failed")
+
+
 def start_status_refresher() -> None:
     """Keep the ready-engine record fresh in the background so status requests never block on an engine."""
     global _refresher
@@ -272,7 +308,7 @@ def start_status_refresher() -> None:
 
     def loop() -> None:
         while True:
-            refresh_ready_engines()
+            refresh_once()
             time.sleep(STATUS_REFRESH_S)
 
     _refresher = threading.Thread(target=loop, name="nativ-remote-engine-status", daemon=True)
@@ -336,7 +372,7 @@ def _with_data(lines: list[bytes], index: int, data: Any) -> bytes:
     return b"\n".join(lines)
 
 
-def _hoist_timings(event: bytes) -> bytes:
+def _hoist_timings(event: bytes, model: str | None = None) -> bytes:
     """Copy a Responses event's `response.timings` to the top level, where Nativ's client reads it.
 
     The bundled server puts speed figures on every event; Splash nests them in the final `response`,
@@ -350,13 +386,22 @@ def _hoist_timings(event: bytes) -> bytes:
         return event
     lines, index, data = parsed
     response = data.get("response") if isinstance(data, dict) else None
-    if not isinstance(response, dict) or "timings" not in response or "timings" in data:
+    if not isinstance(response, dict) or not isinstance(response.get("timings"), dict) or "timings" in data:
         return event
     timings = dict(response["timings"])
-    memory = engine_memory_gb()
+    memory = engine_memory_gb(model)
     if memory is not None:
         timings.setdefault("peak_memory", memory)
     return _with_data(lines, index, {**data, "timings": timings})
+
+
+async def _safe_compaction(compact: Any, response: dict[str, Any]) -> dict[str, Any] | None:
+    """Run the compaction step; whatever goes wrong in it, the reply it follows must still be delivered."""
+    try:
+        return await compact(response)
+    except Exception:  # best-effort feature at the edge of a finished reply; the failure is logged
+        log.exception("compaction failed; the reply is sent uncompacted")
+        return None
 
 
 async def _with_compaction(event: bytes, compact: Any) -> bytes:
@@ -370,14 +415,15 @@ async def _with_compaction(event: bytes, compact: Any) -> bytes:
     response = data.get("response") if isinstance(data, dict) else None
     if not isinstance(data, dict) or data.get("type") != "response.completed" or not isinstance(response, dict):
         return event
-    item = await compact(response)
+    item = await _safe_compaction(compact, response)
     if item is None:
         return event
     response["output"] = [*response.get("output", []), item]
     return _with_data(lines, index, data)
 
 
-async def _relay_responses_and_close(response: httpx.Response, compact: Any = None) -> AsyncIterator[bytes]:
+async def _relay_responses_and_close(response: httpx.Response, compact: Any = None,
+                                      model: str | None = None) -> AsyncIterator[bytes]:
     """Relay a Responses stream event by event, hoisting timings and adding a compaction item to the final
     event, and close the upstream when it ends."""
     pending = b""
@@ -386,9 +432,9 @@ async def _relay_responses_and_close(response: httpx.Response, compact: Any = No
             pending += chunk
             *events, pending = pending.split(SSE_EVENT_END)
             for event in events:
-                yield await _with_compaction(_hoist_timings(event), compact) + SSE_EVENT_END
+                yield await _with_compaction(_hoist_timings(event, model), compact) + SSE_EVENT_END
         if pending:
-            yield pending
+            yield await _with_compaction(_hoist_timings(pending, model), compact)
     finally:
         await response.aclose()
 
@@ -409,21 +455,29 @@ def seal_compaction(items: list[dict[str, Any]]) -> dict[str, Any]:
             "encrypted_content": CAPSULE_PREFIX + json.dumps({"items": items}, separators=(",", ":"))}
 
 
+def _capsule_items(item: dict[str, Any]) -> list[Any] | None:
+    """The context a compaction item stands for, or None when this server did not make it."""
+    content = item.get("encrypted_content")
+    if not isinstance(content, str) or not content.startswith(CAPSULE_PREFIX):
+        return None
+    try:
+        carried = json.loads(content[len(CAPSULE_PREFIX):])["items"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return carried if isinstance(carried, list) else None
+
+
 def expand_compaction(items: list[Any]) -> list[Any]:
-    """Replace the newest compaction item, and everything before it, with the context it stands for."""
+    """Replace the newest compaction item, and everything before it, with the context it stands for. An item this
+    server did not make becomes a note: the app cannot recover from an error, so the chat carries on without it."""
     for index in range(len(items) - 1, -1, -1):
         item = items[index]
         if not (isinstance(item, dict) and item.get("type") == COMPACTION_TYPE):
             continue
-        content = item.get("encrypted_content")
-        if not isinstance(content, str) or not content.startswith(CAPSULE_PREFIX):
-            raise ValueError("Unknown compaction state for this server.")
-        try:
-            carried = json.loads(content[len(CAPSULE_PREFIX):])["items"]
-        except (ValueError, KeyError, TypeError):
-            raise ValueError("Invalid compaction state for this server.") from None
-        if not isinstance(carried, list):
-            raise ValueError("Invalid compaction state for this server.")
+        carried = _capsule_items(item)
+        if carried is None:
+            log.warning("compaction item not made by this server; continuing without it")
+            carried = [{"type": "message", "role": "user", "content": UNAVAILABLE_NOTE}]
         return carried + items[index + 1:]
     return items
 
@@ -432,22 +486,39 @@ def _is_user(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "user"
 
 
+def _type_of(item: Any) -> Any:
+    return item.get("type") if isinstance(item, dict) else None
+
+
+def _text_size(items: list[Any]) -> int:
+    """Characters in the items, ignoring long base64 payloads so images do not skew the characters-per-token ratio."""
+    return len(DATA_URL.sub("", json.dumps(items)))
+
+
 def _group_starts(items: list[Any]) -> list[int]:
-    """Indices where a user turn or a batch of tool calls begins: the only places a cut cannot split a call from its output."""
+    """Indices where a user turn or a batch of tool calls begins."""
     return [index for index, item in enumerate(items)
             if index and isinstance(item, dict) and (_is_user(item) or (
-                item.get("type") == "function_call" and items[index - 1].get("type") != "function_call"))]
+                item.get("type") == "function_call" and _type_of(items[index - 1]) != "function_call"))]
+
+
+def _splits_a_call(items: list[Any], cut: int) -> bool:
+    """True when the tail from `cut` holds an output whose call is before it."""
+    tail = items[cut:]
+    calls = {item.get("call_id") for item in tail if _type_of(item) == "function_call"}
+    return any(_type_of(item) == "function_call_output" and item.get("call_id") not in calls for item in tail)
 
 
 def choose_cut(items: list[Any], budget_tokens: float, tokens_per_char: float) -> int:
-    """Where the verbatim tail starts: the earliest group start whose tail fits the budget, but never later than
-    the final group, which is always kept. 0 means there is nothing before it to summarise."""
-    starts = _group_starts(items)
+    """Where the verbatim tail starts: the earliest group start whose tail fits the budget and keeps every call with
+    its output, but never later than the final such start, which is always kept. 0 means there is nothing before it
+    to summarise."""
+    starts = [start for start in _group_starts(items) if not _splits_a_call(items, start)]
     if not starts:
         return 0
     cut = starts[-1]
     for start in reversed(starts[:-1]):
-        if len(json.dumps(items[start:])) * tokens_per_char > budget_tokens:
+        if _text_size(items[start:]) * tokens_per_char > budget_tokens:
             break
         cut = start
     return cut
@@ -470,8 +541,8 @@ def compacted_items(items: list[Any], summary: str, cut: int) -> list[Any]:
 
 
 def _output_text(response: dict[str, Any]) -> str:
-    return "".join(part.get("text", "") for item in response.get("output", []) if item.get("type") == "message"
-                   for part in item.get("content", []) if isinstance(part, dict))
+    return "".join(part.get("text", "") for item in response.get("output") or [] if item.get("type") == "message"
+                   for part in item.get("content") or [] if isinstance(part, dict))
 
 
 async def compaction_item(client: Any, url: str, headers: dict[str, str], body: dict[str, Any],
@@ -479,32 +550,37 @@ async def compaction_item(client: Any, url: str, headers: dict[str, str], body: 
     """After a reply whose prompt reached the threshold, shrink the conversation. Old tool output is cleared first,
     which costs no model call. If that leaves too much, the engine is asked for a handoff summary sealed with a
     verbatim tail; that request is the prompt just answered plus one instruction, so the prefix cache serves it.
-    Any failure leaves the conversation uncompacted."""
+    Whatever goes wrong, the conversation is left uncompacted and the failure is logged."""
     prompt_tokens = (response.get("usage") or {}).get("input_tokens")
-    if not isinstance(prompt_tokens, int) or prompt_tokens < threshold:
+    items = body.get("input")
+    if not isinstance(prompt_tokens, int) or prompt_tokens < threshold or not isinstance(items, list):
         return None
-    items = body["input"]
-    size = len(json.dumps(items))
-    cut = choose_cut(items, threshold * TAIL_FRACTION, prompt_tokens / max(size, 1))
-    if cut == 0:
-        return None
-    cleared = clear_old_outputs(items, cut)
-    if len(json.dumps(cleared)) * prompt_tokens / max(size, 1) <= threshold * CLEAR_TARGET:
-        return seal_compaction(cleared)
-    request = {**body, "input": [*items, {"type": "message", "role": "user", "content": SUMMARY_INSTRUCTION}],
-               "stream": False, "max_output_tokens": SUMMARY_MAX_TOKENS}
-    request.pop("tool_choice", None)
     try:
+        size = _text_size(items)
+        cut = choose_cut(items, threshold * TAIL_FRACTION, prompt_tokens / max(size, 1))
+        if cut == 0:
+            return None
+        cleared = clear_old_outputs(items, cut)
+        if _text_size(cleared) * prompt_tokens / max(size, 1) <= threshold * CLEAR_TARGET:
+            return seal_compaction(cleared)
+        request = {**body, "input": [*items, {"type": "message", "role": "user", "content": SUMMARY_INSTRUCTION}],
+                   "stream": False, "max_output_tokens": min(SUMMARY_MAX_TOKENS, max(1, int(threshold * SUMMARY_OUTPUT_SHARE)))}
+        for field in ("tool_choice", "text", "response_format"):
+            request.pop(field, None)
         reply = await client.post(url, json=request, headers=headers)
         reply.raise_for_status()
-        summary = _output_text(reply.json())
-    except (httpx.HTTPError, KeyError, ValueError, AttributeError) as error:
-        log.warning("compaction summary failed: %s", error)
+        answer = reply.json()
+        if answer.get("status") not in (None, "completed"):
+            log.warning("compaction summary was %s; leaving the chat uncompacted", answer.get("status"))
+            return None
+        summary = _output_text(answer)
+        if not summary.strip():
+            return None
+        compacted = compacted_items(items, summary, cut)
+        return seal_compaction(compacted) if _text_size(compacted) < size else None
+    except Exception:  # a failed compaction must not cost the reply it follows; the failure is logged
+        log.warning("compaction failed; leaving the chat uncompacted", exc_info=True)
         return None
-    if not summary.strip():
-        return None
-    compacted = compacted_items(items, summary, cut)
-    return seal_compaction(compacted) if len(json.dumps(compacted)) < size else None
 
 
 async def _body_with_compaction(content: bytes, compact: Any) -> bytes:
@@ -513,7 +589,7 @@ async def _body_with_compaction(content: bytes, compact: Any) -> bytes:
         answer = json.loads(content)
     except ValueError:
         return content
-    item = await compact(answer) if isinstance(answer, dict) else None
+    item = await _safe_compaction(compact, answer) if isinstance(answer, dict) else None
     if item is None:
         return content
     answer["output"] = [*answer.get("output", []), item]
@@ -533,10 +609,7 @@ async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str])
     threshold = compaction_threshold(body) if path == "/responses" else None
     if path == "/responses":
         body.pop("context_management", None)
-        try:
-            body = responses_body_for_engine(body)
-        except ValueError as error:
-            return JSONResponse({"error": {"message": str(error), "type": "invalid_request_error"}}, status_code=400)
+        body = responses_body_for_engine(body)
     headers = {k: v for k, v in request.headers.items() if k.lower() in FORWARDED_REQUEST_HEADERS}
     headers.update(_engine_headers(engine))
     client = _http_client()
@@ -555,7 +628,8 @@ async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str])
         return _unavailable(last_error)
     passthrough = {k: v for k, v in response.headers.items() if k.lower() not in HOP_HEADERS}
     if "text/event-stream" in response.headers.get("content-type", ""):
-        relay = _relay_responses_and_close(response, compact) if path == "/responses" else _relay_and_close(response)
+        relay = (_relay_responses_and_close(response, compact, payload.get("model")) if path == "/responses"
+                 else _relay_and_close(response))
         return StreamingResponse(relay, status_code=response.status_code, headers=passthrough)
     try:
         content = await response.aread()
