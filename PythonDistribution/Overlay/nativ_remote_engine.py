@@ -11,6 +11,7 @@ The engines file maps a Nativ model id to its engine:
 """
 from __future__ import annotations
 
+import asyncio
 import http.client
 import json
 import logging
@@ -76,6 +77,10 @@ Keep the handoff short; use compact bullets. Return only the handoff, without re
 CHAT_MESSAGE_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name")
 
 # Splash exposes engine-wide memory in use; it reports no per-reply peak, so this stands in for the app's peak figure.
+PREFILL_ROWS = re.compile(r"^splash_scheduler_prefill_rows_total\s+([0-9.eE+-]+)", re.M)
+CACHE_REUSED = re.compile(r"^splash_cache_reused_tokens_total\s+([0-9.eE+-]+)", re.M)
+PREFILL_POLL_S = 0.5
+PREFILL_REPORT_MIN = 2048  # prompts with fewer uncached tokens than this are not worth a progress ring
 MEMORY_IN_USE = re.compile(r"^splash_memory_current_bytes\s+([0-9.eE+-]+)", re.M)
 BYTES_PER_GB = 1e9
 # How often a ready engine is re-checked, and how long one check may take; requests never wait on it.
@@ -224,24 +229,130 @@ def _count_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return messages
 
 
-async def count_input_tokens(payload: dict[str, Any], engine: dict[str, str]) -> Response:
-    """Answer a Responses token count from the engine's own template and tokenizer, without inference."""
+async def _prompt_token_count(payload: dict[str, Any], engine: dict[str, str]) -> int:
+    """Count a Responses request's prompt tokens with the engine's own template and tokenizer."""
     root = engine["base_url"].rstrip("/").removesuffix("/v1")
     template: dict[str, Any] = {"messages": _count_messages(payload)}
     if payload.get("tools"):
         template["tools"] = payload["tools"]
     client = _http_client()
+    rendered = await client.post(root + "/apply-template", json=template, headers=_engine_headers(engine))
+    rendered.raise_for_status()
+    counted = await client.post(
+        root + "/tokenize", json={"content": rendered.json()["prompt"], "add_special": False},
+        headers=_engine_headers(engine),
+    )
+    counted.raise_for_status()
+    return len(counted.json()["tokens"])
+
+
+async def count_input_tokens(payload: dict[str, Any], engine: dict[str, str]) -> Response:
+    """Answer a Responses token count from the engine's own template and tokenizer, without inference."""
     try:
-        rendered = await client.post(root + "/apply-template", json=template, headers=_engine_headers(engine))
-        rendered.raise_for_status()
-        counted = await client.post(
-            root + "/tokenize", json={"content": rendered.json()["prompt"], "add_special": False},
-            headers=_engine_headers(engine),
-        )
-        counted.raise_for_status()
-        return JSONResponse({"input_tokens": len(counted.json()["tokens"])})
+        return JSONResponse({"input_tokens": await _prompt_token_count(payload, engine)})
     except (httpx.HTTPError, KeyError, ValueError) as error:
         return _unavailable(error)
+
+
+def parse_prefill_counters(text: str) -> tuple[int, int] | None:
+    """Read the engine's running totals of prompt tokens processed and prompt tokens reused from cache."""
+    rows, reused = PREFILL_ROWS.search(text), CACHE_REUSED.search(text)
+    if rows is None or reused is None:
+        return None
+    return int(float(rows.group(1))), int(float(reused.group(1)))
+
+
+class PrefillReporter:
+    """Print the "Prefill ..." log lines the app draws its "Reading prompt" ring from, using the engine's counters.
+
+    The totals are engine-wide, so a request that overlaps another one is attributed that request's work too.
+    """
+
+    def __init__(self, request_id: str, count_tokens: Any, read_counters: Any, emit: Any,
+                 interval: float = PREFILL_POLL_S, minimum: int = PREFILL_REPORT_MIN) -> None:
+        self.request_id = request_id
+        self.count_tokens, self.read_counters, self.emit = count_tokens, read_counters, emit
+        self.interval, self.minimum = interval, minimum
+        self.total: int | None = None
+        self.started = False
+        self.finished = False
+
+    async def run(self) -> None:
+        """Poll until cancelled; a failure here only costs the progress ring, never the reply."""
+        try:
+            await self._poll()
+        except Exception:  # best-effort display feature running beside the request; the failure is logged
+            log.exception("prefill progress stopped")
+
+    async def _poll(self) -> None:
+        """Say nothing when the prompt is mostly served from the engine's cache."""
+        base = await self.read_counters()
+        if base is None:
+            return  # an engine without these counters gets no ring and no extra calls
+        self.total = await self.count_tokens()
+        if not self.total:
+            return
+        last = -1
+        while True:
+            await asyncio.sleep(self.interval)
+            current = await self.read_counters()
+            if current is None:
+                continue
+            processed, reused = current[0] - base[0], current[1] - base[1]
+            if not self.started:
+                if self.total - reused < self.minimum:
+                    continue
+                self.started = True
+                self.emit(f"Prefill started: request={self.request_id} prompt_tokens={self.total}")
+            done = min(max(reused + processed, 0), self.total)
+            if done != last:
+                last = done
+                self.emit(f"Prefill progress: request={self.request_id} tokens={done}/{self.total}")
+
+    def finish(self) -> None:
+        """Close the ring once; does nothing if it was never shown."""
+        if self.started and not self.finished:
+            self.finished = True
+            self.emit(f"Prefill completed: request={self.request_id} prompt_tokens={self.total}")
+
+
+async def _read_prefill_counters(root: str, engine: dict[str, str]) -> tuple[int, int] | None:
+    try:
+        reply = await _http_client().get(root + "/metrics", headers=_engine_headers(engine), timeout=5)
+        reply.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    return parse_prefill_counters(reply.text)
+
+
+async def _count_prompt_tokens(payload: dict[str, Any], engine: dict[str, str]) -> int | None:
+    try:
+        return await _prompt_token_count(payload, engine)
+    except (httpx.HTTPError, KeyError, ValueError):
+        return None
+
+
+def _stop_prefill(task: asyncio.Task | None) -> None:
+    if task is not None:
+        task.cancel()
+
+
+def _print_log_line(line: str) -> None:
+    print(line, flush=True)
+
+
+async def _with_prefill_report(relay: AsyncIterator[bytes], reporter: PrefillReporter,
+                               task: asyncio.Task) -> AsyncIterator[bytes]:
+    """Relay the stream, ending the progress ring when the first generated text arrives or the stream stops."""
+    try:
+        async for chunk in relay:
+            if b'.delta"' in chunk and not task.done():
+                task.cancel()
+                reporter.finish()
+            yield chunk
+    finally:
+        task.cancel()
+        reporter.finish()
 
 
 def _engine_context(engine: dict[str, str]) -> tuple[bool, int | None]:
@@ -628,22 +739,33 @@ async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str])
     client = _http_client()
     url = engine["base_url"].rstrip("/") + path
     compact = partial(compaction_item, client, url, headers, body, threshold) if threshold else None
+    reporter = prefill_task = None
+    if path == "/responses" and body.get("stream"):
+        root = engine["base_url"].rstrip("/").removesuffix("/v1")
+        reporter = PrefillReporter(uuid.uuid4().hex, partial(_count_prompt_tokens, payload, engine),
+                                   partial(_read_prefill_counters, root, engine), _print_log_line)
+        prefill_task = asyncio.create_task(reporter.run())
     last_error: Exception | None = None
     for _ in range(SEND_ATTEMPTS):
         try:
             response = await client.send(client.build_request("POST", url, headers=headers, json=body), stream=True)
             break
         except httpx.InvalidURL as error:
+            _stop_prefill(prefill_task)
             return _unavailable(error)
         except httpx.TransportError as error:
             last_error = error
     else:
+        _stop_prefill(prefill_task)
         return _unavailable(last_error)
     passthrough = {k: v for k, v in response.headers.items() if k.lower() not in HOP_HEADERS}
     if "text/event-stream" in response.headers.get("content-type", ""):
         relay = (_relay_responses_and_close(response, compact, payload.get("model")) if path == "/responses"
                  else _relay_and_close(response))
+        if reporter is not None:
+            relay = _with_prefill_report(relay, reporter, prefill_task)
         return StreamingResponse(relay, status_code=response.status_code, headers=passthrough)
+    _stop_prefill(prefill_task)
     try:
         content = await response.aread()
     except httpx.HTTPError as error:

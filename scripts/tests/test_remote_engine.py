@@ -1,5 +1,6 @@
 """Coverage for forwarding models to an external OpenAI-compatible engine."""
 import asyncio
+import contextlib
 import importlib.util
 import json
 import os
@@ -42,12 +43,16 @@ class StubClient:
     script = []
     posted = []
     post_script = []
+    metrics_text = ""
 
     def __init__(self, *args, **kwargs):
         pass
 
     def build_request(self, method, url, headers=None, json=None):
         return SimpleNamespace(method=method, url=url, headers=headers, json=json)
+
+    async def get(self, url, headers=None, timeout=None):
+        return SimpleNamespace(text=StubClient.metrics_text, raise_for_status=lambda: None)
 
     async def post(self, url, json=None, headers=None):
         StubClient.posted.append(SimpleNamespace(url=url, json=json, headers=headers))
@@ -676,6 +681,160 @@ class CompactionTests(unittest.TestCase):
             return None
         event = completed_event(9)
         self.assertEqual(asyncio.run(self.module._with_compaction(event, decline)), event)
+
+
+class PrefillProgressTests(unittest.TestCase):
+    """The app draws its "Reading prompt" ring from log lines the bundled engine prints; the engine's counters feed the same lines."""
+
+    def setUp(self):
+        self.module = load_module()
+        self.lines = []
+
+    def run_reporter(self, counters, total=20000, minimum=2048):
+        script = list(counters)
+
+        async def scenario():
+            exhausted = asyncio.Event()
+
+            async def read_counters():
+                if script:
+                    return script.pop(0)
+                exhausted.set()
+                await asyncio.sleep(3600)
+
+            async def count_tokens():
+                return total
+
+            reporter = self.module.PrefillReporter(
+                "req1", count_tokens, read_counters, self.lines.append, interval=0, minimum=minimum
+            )
+            task = asyncio.create_task(reporter.run())
+            waiting = asyncio.create_task(exhausted.wait())
+            await asyncio.wait({task, waiting}, return_when=asyncio.FIRST_COMPLETED)
+            waiting.cancel()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            return reporter
+        return asyncio.run(scenario())
+
+    def test_a_cold_prompt_reports_start_then_growing_progress_then_completion(self):
+        reporter = self.run_reporter([(1000, 50), (1000, 50), (6000, 50), (12000, 50), (21000, 50)])
+        reporter.finish()
+        self.assertEqual(self.lines[0], "Prefill started: request=req1 prompt_tokens=20000")
+        progress = [int(line.split("tokens=")[1].split("/")[0]) for line in self.lines if line.startswith("Prefill progress")]
+        self.assertEqual(progress, sorted(progress))
+        self.assertEqual(progress[-1], 20000)
+        self.assertTrue(all(line.endswith("/20000") for line in self.lines if line.startswith("Prefill progress")))
+        self.assertEqual(self.lines[-1], "Prefill completed: request=req1 prompt_tokens=20000")
+
+    def test_cached_tokens_count_as_already_read(self):
+        reporter = self.run_reporter([(0, 0), (0, 15000), (1000, 15000)])
+        first = next(line for line in self.lines if line.startswith("Prefill progress"))
+        self.assertEqual(first, "Prefill progress: request=req1 tokens=15000/20000")
+
+    def test_a_mostly_cached_prompt_shows_nothing(self):
+        reporter = self.run_reporter([(0, 0), (0, 19500), (200, 19500)])
+        reporter.finish()
+        self.assertEqual(self.lines, [])
+
+    def test_progress_never_exceeds_the_prompt_size(self):
+        self.run_reporter([(0, 0), (50000, 0)])
+        self.assertTrue(all(int(line.split("tokens=")[1].split("/")[0]) <= 20000
+                            for line in self.lines if line.startswith("Prefill progress")))
+
+    def test_unreadable_counters_show_nothing_and_do_not_raise(self):
+        reporter = self.run_reporter([None, None, None])
+        reporter.finish()
+        self.assertEqual(self.lines, [])
+
+    def test_a_failing_counter_read_ends_the_poller_without_raising(self):
+        async def broken():
+            raise RuntimeError("boom")
+
+        async def count():
+            return 20000
+
+        async def scenario():
+            reporter = self.module.PrefillReporter("req1", count, broken, self.lines.append, interval=0)
+            with self.assertLogs(level="ERROR"):
+                await reporter.run()
+        asyncio.run(scenario())
+        self.assertEqual(self.lines, [])
+
+    def test_finish_is_idempotent(self):
+        reporter = self.run_reporter([(0, 0), (9000, 0)])
+        reporter.finish()
+        reporter.finish()
+        self.assertEqual(sum(line.startswith("Prefill completed") for line in self.lines), 1)
+
+    def test_the_counters_are_read_from_the_engines_metrics_text(self):
+        text = "splash_scheduler_prefill_rows_total 4930035\nsplash_cache_reused_tokens_total 14985728\nother 1\n"
+        self.assertEqual(self.module.parse_prefill_counters(text), (4930035, 14985728))
+        self.assertIsNone(self.module.parse_prefill_counters("nothing here"))
+
+
+class PrefillStreamScopeTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+
+    def run_stream(self, chunks):
+        finished = []
+
+        async def scenario():
+            async def relay():
+                for chunk in chunks:
+                    yield chunk
+
+            async def forever():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(forever())
+            reporter = SimpleNamespace(finish=lambda: finished.append(1))
+            out = [c async for c in self.module._with_prefill_report(relay(), reporter, task)]
+            await asyncio.sleep(0)
+            return out, task.cancelled(), len(finished)
+        return asyncio.run(scenario())
+
+    def test_the_ring_closes_when_the_first_generated_text_arrives(self):
+        chunks = [b'data: {"type": "response.created"}\n\n', b'data: {"type": "response.output_text.delta"}\n\n']
+        out, cancelled, finishes = self.run_stream(chunks)
+        self.assertEqual(out, chunks)
+        self.assertTrue(cancelled)
+        self.assertGreaterEqual(finishes, 1)
+
+    def test_the_ring_closes_when_a_stream_ends_without_text(self):
+        out, cancelled, finishes = self.run_stream([b'data: {"type": "response.created"}\n\n'])
+        self.assertTrue(cancelled)
+        self.assertGreaterEqual(finishes, 1)
+
+
+class PrefillTaskLifecycleTests(unittest.TestCase):
+    """The progress poller must stop whenever the request ends, including when the engine cannot be reached."""
+
+    def setUp(self):
+        self.module = load_module()
+        StubClient.sent, StubClient.script, StubClient.posted, StubClient.post_script = [], [], [], []
+
+    def forward_and_count_tasks(self, script):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        StubClient.script = script
+        StubClient.post_script = [JSONReply({"prompt": "p"}), JSONReply({"tokens": list(range(20000))})]
+        StubClient.metrics_text = "splash_scheduler_prefill_rows_total 0\nsplash_cache_reused_tokens_total 0\n"
+
+        async def scenario():
+            await self.module.forward(request, {"model": "qwen", "stream": True, "input": chat_history()}, ENGINE)
+            await asyncio.sleep(0)
+            return [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+        return asyncio.run(scenario())
+
+    def test_no_poller_is_left_running_when_the_engine_is_unreachable(self):
+        pending = self.forward_and_count_tasks([StubTransportError("refused"), StubTransportError("refused")])
+        self.assertEqual(pending, [])
+
+    def test_no_poller_is_left_running_for_a_reply_that_is_not_a_stream(self):
+        pending = self.forward_and_count_tasks([UpstreamResponse(content_type="application/json", chunks=[b"{}"])])
+        self.assertEqual(pending, [])
 
 
 class RequestStabilityTests(unittest.TestCase):
