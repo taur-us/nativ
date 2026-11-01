@@ -678,6 +678,42 @@ class CompactionTests(unittest.TestCase):
         self.assertEqual(asyncio.run(self.module._with_compaction(event, decline)), event)
 
 
+class RequestStabilityTests(unittest.TestCase):
+    """The engine's prefix cache matches raw text, so the same tools must always be serialised the same way."""
+
+    def setUp(self):
+        self.module = load_module()
+        StubClient.sent, StubClient.script, StubClient.posted, StubClient.post_script = [], [], [], []
+
+    def sent_tools_text(self, path, tools):
+        request = SimpleNamespace(url=SimpleNamespace(path=path), headers={})
+        StubClient.script = [UpstreamResponse(content_type="text/event-stream", chunks=[b"data: [DONE]\n\n"])]
+        payload = {"model": "qwen", "stream": True, "tools": tools,
+                   "input": chat_history(), "messages": [{"role": "user", "content": "hi"}]}
+        response = asyncio.run(self.module.forward(request, payload, ENGINE))
+
+        async def drain():
+            return [chunk async for chunk in response.content]
+        asyncio.run(drain())
+        return json.dumps(StubClient.sent[-1].json["tools"])
+
+    def test_the_same_tools_in_a_different_key_order_are_sent_identically(self):
+        first = [{"type": "function", "function": {"name": "a", "parameters": {"type": "object", "required": ["x"],
+                  "properties": {"x": {"type": "string", "description": "d"}}}}}]
+        second = [{"function": {"parameters": {"properties": {"x": {"description": "d", "type": "string"}},
+                   "required": ["x"], "type": "object"}, "name": "a"}, "type": "function"}]
+        for path in ("/v1/responses", "/v1/chat/completions"):
+            with self.subTest(path=path):
+                self.assertEqual(self.sent_tools_text(path, first), self.sent_tools_text(path, second))
+
+    def test_the_order_of_the_tool_list_and_of_required_fields_is_kept(self):
+        tools = [{"type": "function", "function": {"name": "b", "parameters": {"required": ["z", "a"]}}},
+                 {"type": "function", "function": {"name": "a", "parameters": {"required": ["m"]}}}]
+        sent = json.loads(self.sent_tools_text("/v1/chat/completions", tools))
+        self.assertEqual([t["function"]["name"] for t in sent], ["b", "a"])
+        self.assertEqual(sent[0]["function"]["parameters"]["required"], ["z", "a"])
+
+
 class CompactionForwardTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()

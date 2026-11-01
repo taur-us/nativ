@@ -596,6 +596,15 @@ async def _body_with_compaction(content: bytes, compact: Any) -> bytes:
     return json.dumps(answer).encode()
 
 
+def sorted_keys(value: Any) -> Any:
+    """Return the value with every object's keys in sorted order; lists keep their order."""
+    if isinstance(value, dict):
+        return {key: sorted_keys(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [sorted_keys(item) for item in value]
+    return value
+
+
 async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str]) -> Response:
     """Send the request to the external engine and return its answer, streaming included."""
     path = upstream_path(request.url.path)
@@ -610,6 +619,10 @@ async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str])
     if path == "/responses":
         body.pop("context_management", None)
         body = responses_body_for_engine(body)
+    if "tools" in body:
+        # The app writes each tool definition's keys in a different order on every request, and the engine's
+        # prefix cache matches raw text, so unsorted tools re-prefill the whole tool block on every turn.
+        body["tools"] = sorted_keys(body["tools"])
     headers = {k: v for k, v in request.headers.items() if k.lower() in FORWARDED_REQUEST_HEADERS}
     headers.update(_engine_headers(engine))
     client = _http_client()
