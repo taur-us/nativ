@@ -1,4 +1,5 @@
 """Coverage for forwarding models to an external OpenAI-compatible engine."""
+import ast
 import asyncio
 import contextlib
 import importlib.util
@@ -12,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 SOURCE = Path(__file__).resolve().parents[2] / "PythonDistribution/Overlay/nativ_remote_engine.py"
+SERVER_SOURCE = SOURCE.with_name("nativ_server.py")
 ENGINE = {"base_url": "http://127.0.0.1:8091/v1", "model": "engine-model", "api_key": "secret"}
 
 
@@ -35,6 +37,14 @@ class StubTransportError(StubHTTPError):
 
 class StubInvalidURL(Exception):
     pass
+
+
+class StubHTTPException(Exception):
+    """Stands in for fastapi.HTTPException."""
+
+    def __init__(self, status_code, detail=None):
+        super().__init__(detail)
+        self.status_code, self.detail = status_code, detail
 
 
 class Pending:
@@ -116,7 +126,7 @@ def load_module():
             AsyncClient=StubClient, Timeout=lambda *a, **k: None, HTTPError=StubHTTPError,
             TransportError=StubTransportError, InvalidURL=StubInvalidURL, Response=UpstreamResponse,
         ),
-        "fastapi": ModuleType("fastapi"),
+        "fastapi": SimpleNamespace(HTTPException=StubHTTPException),
         "fastapi.responses": SimpleNamespace(JSONResponse=StubResponse, Response=StubResponse, StreamingResponse=StubResponse),
     }
     spec = importlib.util.spec_from_file_location("nativ_remote_engine_under_test", SOURCE)
@@ -569,6 +579,72 @@ class RemoteModelStatusTests(unittest.TestCase):
                 shown = self.module.with_remote_model_loaded({"loaded_model": None,
                                                               "model_load_progress": {"stage": stage}})
                 self.assertEqual(shown["loaded_model"], "qwen")
+
+
+class ExternalLoadGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+        self.module.load_engines = lambda: {"qwen": {"base_url": "http://127.0.0.1:8091/v1"}}
+        self.loaded = []
+        self.guarded = self.module.refusing_external_loads(
+            lambda *args, **kwargs: self.loaded.append((args, kwargs)) or "resources")
+
+    def test_a_mapped_model_is_refused_before_the_loader_runs(self):
+        with self.assertRaises(StubHTTPException) as refused:
+            self.guarded("qwen", None, model_kind="text_generation")
+        self.assertEqual(refused.exception.status_code, 501)
+        self.assertIn("qwen", refused.exception.detail)
+        self.assertEqual(self.loaded, [])
+
+    def test_a_mapped_model_named_by_keyword_is_refused_too(self):
+        with self.assertRaises(StubHTTPException):
+            self.guarded(model_path="qwen")
+        self.assertEqual(self.loaded, [])
+
+    def test_other_models_load_with_their_arguments_unchanged(self):
+        self.assertEqual(self.guarded("local-model", "adapter", model_kind="auto"), "resources")
+        self.assertEqual(self.loaded, [(("local-model", "adapter"), {"model_kind": "auto"})])
+
+    def test_asking_to_load_a_mapped_model_succeeds_without_loading_it(self):
+        self.assertEqual(self.module.external_load_reply("qwen", {}),
+                         {"status": "loaded", "model": "qwen", "loaded_models": {}})
+
+    def test_asking_to_load_any_other_model_is_left_to_the_server(self):
+        self.assertIsNone(self.module.external_load_reply("local-model", {}))
+
+
+class LoadGuardInstallTests(unittest.TestCase):
+    """The server wraps whichever names the bundled server's callers really look up."""
+
+    def install(self, app_names, package_names):
+        tree = ast.parse(SERVER_SOURCE.read_text())
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "install_remote_engine_load_guard")
+        app = SimpleNamespace(**{name: f"app.{name}" for name in app_names})
+        package = SimpleNamespace(**{name: f"package.{name}" for name in package_names})
+        namespace = {
+            "base": package,
+            "importlib": SimpleNamespace(import_module=lambda name: app),
+            "remote_engine": SimpleNamespace(refusing_external_loads=lambda loader: ("guarded", loader)),
+        }
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(SERVER_SOURCE), "exec"), namespace)
+        namespace["install_remote_engine_load_guard"]()
+        return app, package
+
+    def test_a_server_with_an_inner_loader_is_guarded_there_only(self):
+        app, package = self.install(("get_cached_model", "_get_cached_model"), ("get_cached_model",))
+        self.assertEqual(app._get_cached_model, ("guarded", "app._get_cached_model"))
+        self.assertEqual(app.get_cached_model, "app.get_cached_model")
+        self.assertEqual(package.get_cached_model, "package.get_cached_model")
+
+    def test_an_older_server_is_guarded_in_the_module_and_the_package_copy(self):
+        app, package = self.install(("get_cached_model",), ("get_cached_model",))
+        self.assertEqual(app.get_cached_model, ("guarded", "app.get_cached_model"))
+        self.assertEqual(package.get_cached_model, ("guarded", "package.get_cached_model"))
+
+    def test_a_server_with_no_known_loader_stops_the_launch(self):
+        with self.assertRaises(AttributeError):
+            self.install((), ())
 
 
 def summary_reply(text="SUM"):

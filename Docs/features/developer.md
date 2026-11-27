@@ -89,7 +89,11 @@ as before. The file is read per request, so edits apply without a restart.
   reported while a model is loaded or loading in-process, so with several engines or a mixed setup the app
   may size its threshold from another model's context. A chat whose stored compaction item came from another server (for example an in-process
   compaction made before the model was listed here) carries on without it, with a note saying so.
-- A listed model is never preloaded in-process, even when it is the active model.
+- A listed model is never loaded in-process, including at start-up when it is the active model.
+  `/v1/models/load` answers that it is loaded without doing anything, which is what the Integrations tab
+  needs. Any other route that would load it, such as the Anthropic Messages API, answers with an error
+  (501 from the loader, which a route may report under its own status). So an integration that only speaks
+  an unforwarded API does not work with a forwarded model.
 - Model-load settings such as KV-cache bits, prefix caching, and draft models belong to the engine and
   have no effect on a forwarded model.
 

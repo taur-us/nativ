@@ -1492,6 +1492,11 @@ def install_metrics_overlay() -> None:
         if adapter is not None and not isinstance(adapter, str):
             raise HTTPException(status_code=400, detail="adapter_path must be a string or null.")
 
+        external = remote_engine.external_load_reply(
+            model.strip(), current_runtime_snapshot().get("loaded_models", {}))
+        if external is not None:
+            return external
+
         try:
             base.get_cached_model(model.strip(), adapter)
         except HTTPException:
@@ -1528,6 +1533,19 @@ def install_metrics_overlay() -> None:
         return {"status": "queued", "routine_id": routine_id}
 
 
+def install_remote_engine_load_guard() -> None:
+    """Refuse to load an externally served model in-process, whichever route asks for it."""
+    base_app = importlib.import_module("mlx_vlm.server.app")
+    if hasattr(base_app, "_get_cached_model"):
+        # Every caller ends up here: the public loader looks this name up on each call.
+        bindings = [(base_app, "_get_cached_model")]
+    else:
+        # Older servers: routes use the package's copy of the loader, start-up uses the module's.
+        bindings = [(base_app, "get_cached_model"), (base, "get_cached_model")]
+    for owner, name in bindings:
+        setattr(owner, name, remote_engine.refusing_external_loads(getattr(owner, name)))
+
+
 def install_remote_engine_status() -> None:
     """Make /health report a ready externally served model as loaded, with the engine's context size."""
     # The package's `app` attribute is the FastAPI instance, so a plain `import ... as` would not return the module.
@@ -1539,6 +1557,7 @@ def install_remote_engine_status() -> None:
 
 def main() -> None:
     sys.argv[1:] = remote_engine.without_remote_preload(sys.argv[1:], remote_engine.load_engines())
+    install_remote_engine_load_guard()
     install_remote_engine_status()
     install_metrics_overlay()
     install_metrics_access_log_filter()

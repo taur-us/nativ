@@ -26,6 +26,7 @@ from functools import partial
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 import httpx
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 log = logging.getLogger("nativ.remote_engine")
@@ -47,6 +48,10 @@ CONNECT_TIMEOUT_S = 10
 FINISHED_LOAD_STAGES = frozenset({"ready", "failed", "cancelled"})
 # An idle pooled connection the engine has since closed fails on first use; one more try opens a new one.
 SEND_ATTEMPTS = 2
+
+# Answers a route that would have loaded an externally served model in-process.
+NOT_LOADED_HERE = ("{model} is served by an external engine, so Nativ does not load it. "
+                   "Only Chat Completions and Responses requests reach that engine.")
 
 SSE_EVENT_END = b"\n\n"
 # A comment line: the app's stream readers skip it, and it keeps an idle stream from timing out.
@@ -140,6 +145,24 @@ def engine_for(payload: Any, engines: dict[str, dict[str, str]]) -> dict[str, st
         return None
     model = payload.get("model")
     return engines.get(model) if isinstance(model, str) else None
+
+
+def refusing_external_loads(loader: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap the bundled server's model loader so a mapped model is never loaded in-process, whichever route asks."""
+    def guarded(model_path: str, *args: Any, **kwargs: Any) -> Any:
+        if engine_for({"model": model_path}, load_engines()) is not None:
+            raise HTTPException(status_code=501, detail=NOT_LOADED_HERE.format(model=model_path))
+        return loader(model_path, *args, **kwargs)
+
+    return guarded
+
+
+def external_load_reply(model: str, loaded_models: dict[str, Any]) -> dict[str, Any] | None:
+    """The reply to a request to load `model` when an external engine serves it; None when this server loads it.
+    There is nothing to load, and the app treats any other reply as a failed launch of an integration."""
+    if engine_for({"model": model}, load_engines()) is None:
+        return None
+    return {"status": "loaded", "model": model, "loaded_models": loaded_models}
 
 
 def upstream_path(request_path: str) -> str | None:
