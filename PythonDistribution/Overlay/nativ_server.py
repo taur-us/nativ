@@ -1548,13 +1548,16 @@ def install_remote_engine_load_guard() -> None:
     """Refuse to load an externally served model in-process, whichever route asks for it."""
     base_app = importlib.import_module("mlx_vlm.server.app")
     if hasattr(base_app, "_get_cached_model"):
-        # Every caller ends up here: the public loader looks this name up on each call.
-        bindings = [(base_app, "_get_cached_model")]
+        # Every server route ends up here: the public loader looks this name up on each call.
+        bindings = [(base_app, "_get_cached_model", "model_path")]
     else:
         # Older servers: routes use the package's copy of the loader, start-up uses the module's.
-        bindings = [(base_app, "get_cached_model"), (base, "get_cached_model")]
-    for owner, name in bindings:
-        setattr(owner, name, remote_engine.refusing_external_loads(getattr(owner, name)))
+        bindings = [(base_app, "get_cached_model", "model_path"), (base, "get_cached_model", "model_path")]
+    # Realtime voice sessions and draft models skip that and go to the library, which looks these up on each call.
+    bindings += [(importlib.import_module("mlx_vlm.utils"), "load_model", "model_path"),
+                 (importlib.import_module("mlx_vlm.speculative.drafters"), "load_drafter", "path_or_repo")]
+    for owner, name, parameter in bindings:
+        setattr(owner, name, remote_engine.refusing_external_loads(getattr(owner, name), parameter))
 
 
 def install_remote_engine_status() -> None:

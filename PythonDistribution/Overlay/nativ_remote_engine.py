@@ -22,7 +22,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator
 
@@ -214,11 +214,13 @@ def require_loadable(source: Any) -> None:
         raise HTTPException(status_code=501, detail=NOT_LOADED_HERE.format(model=model))
 
 
-def refusing_external_loads(loader: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap the bundled server's model loader so a listed model is never loaded in-process, whichever route asks."""
-    def guarded(model_path: str, *args: Any, **kwargs: Any) -> Any:
-        require_loadable(model_path)
-        return loader(model_path, *args, **kwargs)
+def refusing_external_loads(loader: Callable[..., Any], parameter: str = "model_path") -> Callable[..., Any]:
+    """Wrap one of the bundled server's loaders so a listed model is never loaded in-process through it.
+    `parameter` names the loader's first argument, which says what to load."""
+    @wraps(loader)
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        require_loadable(args[0] if args else kwargs.get(parameter))
+        return loader(*args, **kwargs)
 
     return guarded
 

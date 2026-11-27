@@ -709,6 +709,15 @@ class ExternalLoadGuardTests(unittest.TestCase):
         self.assertIn("remote-engines.json", refused.exception.detail)
         self.assertEqual(self.loaded, [])
 
+    def test_a_loader_is_checked_by_the_name_of_its_own_first_argument(self):
+        drafter = self.module.refusing_external_loads(
+            lambda *args, **kwargs: self.loaded.append((args, kwargs)), "path_or_repo")
+        with self.assertRaises(StubHTTPException):
+            drafter(path_or_repo="qwen", kind="dflash")
+        self.assertEqual(self.loaded, [])
+        drafter(path_or_repo="other-draft")
+        self.assertEqual(self.loaded, [((), {"path_or_repo": "other-draft"})])
+
     def test_other_models_load_with_their_arguments_unchanged(self):
         self.assertEqual(self.guarded("local-model", "adapter", model_kind="auto"), "resources")
         self.assertEqual(self.loaded, [(("local-model", "adapter"), {"model_kind": "auto"})])
@@ -765,31 +774,46 @@ class ForwardedSpeedAnalyticsTests(unittest.TestCase):
 class LoadGuardInstallTests(unittest.TestCase):
     """The server wraps whichever names the bundled server's callers really look up."""
 
+    LIBRARY = {"mlx_vlm.utils": ("load_model",), "mlx_vlm.speculative.drafters": ("load_drafter",)}
+
     def install(self, app_names, package_names):
         tree = ast.parse(SERVER_SOURCE.read_text())
         function = next(node for node in tree.body
                         if isinstance(node, ast.FunctionDef) and node.name == "install_remote_engine_load_guard")
+        modules = {name: SimpleNamespace(**{loader: f"{name}.{loader}" for loader in loaders})
+                   for name, loaders in self.LIBRARY.items()}
         app = SimpleNamespace(**{name: f"app.{name}" for name in app_names})
+        modules["mlx_vlm.server.app"] = app
         package = SimpleNamespace(**{name: f"package.{name}" for name in package_names})
         namespace = {
             "base": package,
-            "importlib": SimpleNamespace(import_module=lambda name: app),
-            "remote_engine": SimpleNamespace(refusing_external_loads=lambda loader: ("guarded", loader)),
+            "importlib": SimpleNamespace(import_module=modules.__getitem__),
+            "remote_engine": SimpleNamespace(
+                refusing_external_loads=lambda loader, parameter: ("guarded", loader, parameter)),
         }
         exec(compile(ast.Module(body=[function], type_ignores=[]), str(SERVER_SOURCE), "exec"), namespace)
         namespace["install_remote_engine_load_guard"]()
-        return app, package
+        return app, package, modules
 
     def test_a_server_with_an_inner_loader_is_guarded_there_only(self):
-        app, package = self.install(("get_cached_model", "_get_cached_model"), ("get_cached_model",))
-        self.assertEqual(app._get_cached_model, ("guarded", "app._get_cached_model"))
+        app, package, _ = self.install(("get_cached_model", "_get_cached_model"), ("get_cached_model",))
+        self.assertEqual(app._get_cached_model, ("guarded", "app._get_cached_model", "model_path"))
         self.assertEqual(app.get_cached_model, "app.get_cached_model")
         self.assertEqual(package.get_cached_model, "package.get_cached_model")
 
     def test_an_older_server_is_guarded_in_the_module_and_the_package_copy(self):
-        app, package = self.install(("get_cached_model",), ("get_cached_model",))
-        self.assertEqual(app.get_cached_model, ("guarded", "app.get_cached_model"))
-        self.assertEqual(package.get_cached_model, ("guarded", "package.get_cached_model"))
+        app, package, _ = self.install(("get_cached_model",), ("get_cached_model",))
+        self.assertEqual(app.get_cached_model, ("guarded", "app.get_cached_model", "model_path"))
+        self.assertEqual(package.get_cached_model, ("guarded", "package.get_cached_model", "model_path"))
+
+    def test_the_library_weight_and_draft_loaders_are_guarded_on_every_server(self):
+        for app_names in (("get_cached_model", "_get_cached_model"), ("get_cached_model",)):
+            with self.subTest(app_names=app_names):
+                _, _, modules = self.install(app_names, ("get_cached_model",))
+                self.assertEqual(modules["mlx_vlm.utils"].load_model,
+                                 ("guarded", "mlx_vlm.utils.load_model", "model_path"))
+                self.assertEqual(modules["mlx_vlm.speculative.drafters"].load_drafter,
+                                 ("guarded", "mlx_vlm.speculative.drafters.load_drafter", "path_or_repo"))
 
     def test_a_server_with_no_known_loader_stops_the_launch(self):
         with self.assertRaises(AttributeError):
