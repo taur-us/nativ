@@ -1234,6 +1234,37 @@ class CompactionRobustnessTests(unittest.TestCase):
         event = b'data: {"response": {"timings": null}}'
         self.assertEqual(self.module._hoist_timings(event), event)
 
+    def summary_request(self, body, context=(None, None), tokens=1000, threshold=500):
+        StubClient.posted, StubClient.post_script = [], [summary_reply()]
+        asyncio.run(self.module.compaction_item(StubClient(), "http://engine/v1/responses", {}, body, threshold,
+                                                {"usage": {"input_tokens": tokens}}, context=context))
+        return StubClient.posted[0].json if StubClient.posted else None
+
+    def test_the_summary_generates_no_reasoning_and_leaves_the_prompts_rendering_alone(self):
+        rendering = {"chat_template_kwargs": {"enable_thinking": True, "custom": 1}, "reasoning": {"effort": "high"}}
+        body = {"model": "m", "input": chat_history(), "temperature": 0.8, "thinking_token_budget": 512, **rendering}
+        sent = self.summary_request(body)
+        self.assertEqual((sent["thinking_token_budget"], sent["temperature"]), (0, 0))
+        # Anything the engine renders into the prompt must match the chat's request, or its cache misses.
+        self.assertEqual({key: sent[key] for key in rendering}, rendering)
+        self.assertEqual(body["thinking_token_budget"], 512)  # the chat's own request is untouched
+
+    def test_the_summary_is_told_to_leave_out_recovered_excerpts_only_when_there_are_some(self):
+        body = {"model": "m", "input": chat_history()}
+        plain = self.summary_request(body)["input"][-1]["content"]
+        recovered = self.summary_request(body, context=("Recovered tool excerpts: X", None))["input"][-1]["content"]
+        self.assertEqual(plain, self.module.SUMMARY_INSTRUCTION)
+        self.assertEqual(recovered, self.module.SUMMARY_INSTRUCTION + "\n" + self.module.SUMMARY_SKIPS_RECOVERY)
+
+    def test_a_large_current_state_block_stops_clearing_alone_counting_as_enough(self):
+        items = history()
+        block = "z" * 3000
+        for context, summarised in (((None, None), False), ((None, block), True)):
+            with self.subTest(block=len(context[1] or "")):
+                size = self.module._text_size(self.module._with_context(items, context, True))
+                sent = self.summary_request({"model": "m", "input": items}, context=context, tokens=size, threshold=4000)
+                self.assertEqual(sent is not None, summarised)
+
     def test_a_second_compaction_replaces_the_first_handoff_instead_of_stacking_it(self):
         StubClient.post_script = [summary_reply("FIRST")]
         first = self.compaction_item({"model": "m", "input": chat_history()})

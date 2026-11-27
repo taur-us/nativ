@@ -72,6 +72,8 @@ they were made, completed work, unresolved questions, exact identifiers and file
 List which parts of the task are complete and which remain, with the exact values found so far.
 Incorporate any previous handoff, updating superseded facts. Omit repetitive tool output.
 Keep the handoff short; use compact bullets. Return only the handoff, without reasoning or commentary."""
+SUMMARY_SKIPS_RECOVERY = ("Leave the recovered tool excerpts at the start of the conversation out of the handoff; "
+                          "they are supplied again when needed.")
 
 # Message fields that carry the conversation; everything else Nativ adds is presentation data.
 CHAT_MESSAGE_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name")
@@ -773,15 +775,32 @@ def _output_text(response: dict[str, Any]) -> str:
                    for part in item.get("content") or [] if isinstance(part, dict))
 
 
+def _summary_request(body: dict[str, Any], items: list[Any], recovered: str | None, output_limit: int) -> dict[str, Any]:
+    """The request just answered, less its current-state block, plus the handoff instruction, generated without
+    reasoning, at temperature 0, with no tool choice or output format.
+
+    It must render as the chat's request did, or the engine re-reads the whole conversation, which is why it differs
+    from the bundled server's summary twice. Reasoning is stopped by a budget of zero and the thinking switch is left
+    alone: Splash renders the start of the prompt differently with thinking off. The recovered excerpts stay for the
+    same reason, and the instruction asks for them to be left out of the handoff."""
+    instruction = SUMMARY_INSTRUCTION if recovered is None else f"{SUMMARY_INSTRUCTION}\n{SUMMARY_SKIPS_RECOVERY}"
+    prompt = [*_with_context(items, (recovered, None), typed=True),
+              {"type": "message", "role": "user", "content": instruction}]
+    request = {**body, "input": prompt, "stream": False, "max_output_tokens": output_limit, "temperature": 0,
+               "thinking_token_budget": 0}
+    for field in ("tool_choice", "text", "response_format"):
+        request.pop(field, None)
+    return request
+
+
 async def compaction_item(client: Any, url: str, headers: dict[str, str], body: dict[str, Any],
                           threshold: int, response: dict[str, Any],
                           context: tuple[str | None, str | None] = (None, None)) -> dict[str, Any] | None:
     """After a reply whose prompt reached the threshold, shrink the conversation. Old tool output is cleared first,
     which costs no model call. If that leaves too much, the engine is asked for a handoff summary sealed with a
-    verbatim tail; that request is the prompt just answered, less its current-state block, plus one instruction, so
-    the prefix cache serves it (after a current-state block, from the point the warm-up left). `body` holds the
-    conversation without the request-local `context` blocks, which are never sealed. Whatever goes wrong, the
-    conversation is left uncompacted and the failure is logged."""
+    verbatim tail; the prefix cache serves that request (after a current-state block, from the point the warm-up
+    left). `body` holds the conversation without the request-local `context` blocks, neither of which is copied into
+    the sealed item. Whatever goes wrong, the conversation is left uncompacted and the failure is logged."""
     prompt_tokens = (response.get("usage") or {}).get("input_tokens")
     items = body.get("input")
     if not isinstance(prompt_tokens, int) or prompt_tokens < threshold or not isinstance(items, list):
@@ -794,13 +813,10 @@ async def compaction_item(client: Any, url: str, headers: dict[str, str], body: 
         if cut == 0:
             return None
         cleared = clear_old_outputs(items, cut)
-        if _text_size(cleared) * tokens_per_char <= threshold * CLEAR_TARGET:
+        if _text_size(_with_context(cleared, context, typed=True)) * tokens_per_char <= threshold * CLEAR_TARGET:
             return seal_compaction(cleared)
-        answered = _with_context(items, (context[0], None), typed=True)
-        request = {**body, "input": [*answered, {"type": "message", "role": "user", "content": SUMMARY_INSTRUCTION}],
-                   "stream": False, "max_output_tokens": min(SUMMARY_MAX_TOKENS, max(1, int(threshold * SUMMARY_OUTPUT_SHARE)))}
-        for field in ("tool_choice", "text", "response_format"):
-            request.pop(field, None)
+        output_limit = min(SUMMARY_MAX_TOKENS, max(1, int(threshold * SUMMARY_OUTPUT_SHARE)))
+        request = _summary_request(body, items, context[0], output_limit)
         reply = await client.post(url, json=request, headers=headers)
         reply.raise_for_status()
         answer = reply.json()

@@ -58,7 +58,10 @@ as before. The file is read per request, so edits apply without a restart.
   and excerpts of older tool results as `tool_result_context`. Engines ignore both fields, so they are
   written into the prompt where the bundled server puts them: the excerpts ahead of the conversation
   (only for results it no longer shows, including ones compaction cleared) and the current state as the
-  last message. Token counts include them, and neither is stored in a compaction item.
+  last message. Token counts include them, and neither block is copied into a compaction item. Unlike
+  the bundled server, the summary request keeps the tool excerpts, because removing them would make the
+  engine re-read the whole conversation; the model is told to leave them out of the handoff, which is
+  not a guarantee.
 - When there is current state to send, the engine first gets the conversation without it, capped at one
   output token. Splash keeps reusable state only at the end of a prompt, so without this the next turn
   would diverge before that point and re-read the whole conversation. The extra request does the reading
@@ -71,7 +74,9 @@ as before. The file is read per request, so edits apply without a restart.
   replaced by a short placeholder (every message and call is kept, and so is a verbatim tail of recent
   turns), which costs no model call. If that still leaves the context above 60% of the threshold, as in a
   long text-only chat, the engine is asked for a handoff summary instead (the same prompt plus one
-  instruction, so its prefix cache serves it). The newest tool-call batch is always kept intact. If the
+  instruction, so its prefix cache serves it), at temperature 0 and with a thinking budget of zero. The
+  chat's thinking switch is left as it is: Splash renders the prompt differently with thinking off, which
+  would make it re-read the whole conversation. The newest tool-call batch is always kept intact. If the
   summary fails, the chat continues uncompacted.
 - While an engine's `/status` reports it ready, `/health` and `/metrics` show the listed model as loaded
   with the engine's context size, so the app sizes its compaction threshold from it. The engine's
