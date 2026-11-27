@@ -240,7 +240,7 @@ def _recovery_text(context: Any, history: list[Any]) -> str | None:
         if width > RECOVERY_MIN_NOTE_BYTES:
             width = max(RECOVERY_MIN_NOTE_BYTES, width * 3 // 4)
         else:
-            notes.pop()
+            notes.pop(0)  # the oldest first
     return None
 
 

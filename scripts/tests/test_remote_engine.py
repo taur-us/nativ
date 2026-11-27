@@ -1008,8 +1008,8 @@ class RequestContextTests(unittest.TestCase):
         notes = [(f"gone{number}", f"note{number} " + "z" * 2000) for number in range(12)]
         text = self.sent({"input": history(), "tool_result_context": excerpts(*notes, max_bytes=600)})["input"][0]["content"]
         self.assertLessEqual(len(text.encode()), 600)
-        self.assertIn("note0", text)
-        self.assertNotIn("note11", text)
+        self.assertIn("note11 ", text)  # the newest excerpt is kept and the oldest dropped, as the bundled server does
+        self.assertNotIn("note0 ", text)
 
     def test_excerpts_for_results_all_still_present_add_nothing(self):
         body = self.sent({"input": history(), "tool_result_context": excerpts(("c1", "A"), ("c2", "B"))})
