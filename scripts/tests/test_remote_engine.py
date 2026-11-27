@@ -1389,10 +1389,10 @@ class CompactionRobustnessTests(unittest.TestCase):
         event = b'data: {"response": {"timings": null}}'
         self.assertEqual(self.module._hoist_timings(event), event)
 
-    def summary_request(self, body, context=(None, None), tokens=1000, threshold=500):
+    def summary_request(self, body, app_request=None, tokens=1000, threshold=500):
         StubClient.posted, StubClient.post_script = [], [summary_reply()]
         asyncio.run(self.module.compaction_item(StubClient(), "http://engine/v1/responses", {}, body, threshold,
-                                                {"usage": {"input_tokens": tokens}}, context=context))
+                                                {"usage": {"input_tokens": tokens}}, app_request=app_request))
         return StubClient.posted[0].json if StubClient.posted else None
 
     def test_the_summary_generates_no_reasoning_and_leaves_the_prompts_rendering_alone(self):
@@ -1407,17 +1407,30 @@ class CompactionRobustnessTests(unittest.TestCase):
     def test_the_summary_is_told_to_leave_out_recovered_excerpts_only_when_there_are_some(self):
         body = {"model": "m", "input": chat_history()}
         plain = self.summary_request(body)["input"][-1]["content"]
-        recovered = self.summary_request(body, context=("Recovered tool excerpts: X", None))["input"][-1]["content"]
+        recovered = self.summary_request(body, {"tool_result_context": excerpts(("gone", "X"))})["input"][-1]["content"]
         self.assertEqual(plain, self.module.SUMMARY_INSTRUCTION)
         self.assertEqual(recovered, self.module.SUMMARY_INSTRUCTION + "\n" + self.module.SUMMARY_SKIPS_RECOVERY)
 
     def test_a_large_current_state_block_stops_clearing_alone_counting_as_enough(self):
         items = history()
         block = "z" * 3000
-        for context, summarised in (((None, None), False), ((None, block), True)):
-            with self.subTest(block=len(context[1] or "")):
-                size = self.module._text_size(self.module._with_context(items, context, True))
-                sent = self.summary_request({"model": "m", "input": items}, context=context, tokens=size, threshold=4000)
+        for state, summarised in ((None, False), (block, True)):
+            with self.subTest(block=len(state or "")):
+                size = self.module._text_size(self.module._with_context(items, (None, state), True))
+                sent = self.summary_request({"model": "m", "input": items}, {"transient_context": state},
+                                            tokens=size, threshold=4000)
+                self.assertEqual(sent is not None, summarised)
+
+    def test_clearing_is_judged_with_the_excerpts_the_cleared_history_will_bring_back(self):
+        items = history()
+        cleared_size = self.module._text_size(self.module.clear_old_outputs(items, 4))
+        threshold = int((cleared_size + 200) / self.module.CLEAR_TARGET)  # fits cleared, but not with an excerpt back
+        size = self.module._text_size(items)  # one token per character
+        for note, summarised in (("gone-before-and-after", False), ("c1", True)):
+            with self.subTest(excerpt_for=note):
+                # "c1" is in the history now, so it costs nothing until clearing blanks it.
+                app_request = {"tool_result_context": excerpts((note, "E" * 2000))} if note == "c1" else None
+                sent = self.summary_request({"model": "m", "input": items}, app_request, tokens=size, threshold=threshold)
                 self.assertEqual(sent is not None, summarised)
 
     def test_a_second_compaction_replaces_the_first_handoff_instead_of_stacking_it(self):

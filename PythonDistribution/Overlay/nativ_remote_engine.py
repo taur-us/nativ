@@ -813,25 +813,30 @@ def _summary_request(body: dict[str, Any], items: list[Any], recovered: str | No
 
 async def compaction_item(client: Any, url: str, headers: dict[str, str], body: dict[str, Any],
                           threshold: int, response: dict[str, Any],
-                          context: tuple[str | None, str | None] = (None, None)) -> dict[str, Any] | None:
+                          app_request: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """After a reply whose prompt reached the threshold, shrink the conversation. Old tool output is cleared first,
     which costs no model call. If that leaves too much, the engine is asked for a handoff summary sealed with a
     verbatim tail; the prefix cache serves that request (after a current-state block, from the point the warm-up
-    left). `body` holds the conversation without the request-local `context` blocks, neither of which is copied into
-    the sealed item. Whatever goes wrong, the conversation is left uncompacted and the failure is logged."""
+    left). `body` holds the conversation without the app's request-local blocks, which are rebuilt from `app_request`,
+    the request as the app sent it; neither block is copied into the sealed item. Whatever goes wrong, the
+    conversation is left uncompacted and the failure is logged."""
     prompt_tokens = (response.get("usage") or {}).get("input_tokens")
     items = body.get("input")
     if not isinstance(prompt_tokens, int) or prompt_tokens < threshold or not isinstance(items, list):
         return None
     try:
         size = _text_size(items)
+        fields = app_request or {}
+        context = request_context(fields, items)
         # The engine's count covers everything it was sent, request-local blocks included.
         tokens_per_char = prompt_tokens / max(_text_size(_with_context(items, context, typed=True)), 1)
         cut = choose_cut(items, threshold * TAIL_FRACTION, tokens_per_char)
         if cut == 0:
             return None
         cleared = clear_old_outputs(items, cut)
-        if _text_size(_with_context(cleared, context, typed=True)) * tokens_per_char <= threshold * CLEAR_TARGET:
+        # Judged as the next prompt will be sent: clearing hides results, which brings their excerpts back.
+        upcoming = _with_context(cleared, request_context(fields, cleared), typed=True)
+        if _text_size(upcoming) * tokens_per_char <= threshold * CLEAR_TARGET:
             return seal_compaction(cleared)
         output_limit = min(SUMMARY_MAX_TOKENS, max(1, int(threshold * SUMMARY_OUTPUT_SHARE)))
         request = _summary_request(body, items, context[0], output_limit)
@@ -940,7 +945,7 @@ async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str])
     headers.update(_engine_headers(engine))
     client = _http_client()
     url = engine["base_url"].rstrip("/") + path
-    compact = partial(compaction_item, client, url, headers, body, threshold, context=context) if threshold else None
+    compact = partial(compaction_item, client, url, headers, body, threshold, app_request=payload) if threshold else None
     sent = body
     if context != (None, None):
         sent = {**body, history_key: _with_context(body.get(history_key), context, typed=path == "/responses")}
