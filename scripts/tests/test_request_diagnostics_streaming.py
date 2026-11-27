@@ -16,8 +16,9 @@ class StreamingRequestDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     def setUpClass(cls):
         source = Path(__file__).resolve().parents[2] / 'PythonDistribution/Overlay/nativ_server.py'
         parsed = ast.parse(source.read_text())
-        names = {'StreamAccumulator', 'install_metrics_overlay'}
-        definitions = [node for node in parsed.body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
+        names = {'StreamAccumulator', 'install_metrics_overlay', 'request_payload'}
+        kinds = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        definitions = [node for node in parsed.body if isinstance(node, kinds) and node.name in names]
         cls.code = compile(ast.fix_missing_locations(ast.Module(
             body=ast.parse('from __future__ import annotations').body + definitions,
             type_ignores=[],
@@ -43,6 +44,10 @@ class StreamingRequestDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             merge_base_metrics=lambda completion, _: completion,
             safe_failure_code=lambda _: 'runtime_error',
             _BASE_METRICS_CAPTURE=contextvars.ContextVar('stream-test', default=None),
+            # No model here is served by an external engine, so every request stays in-process.
+            remote_engine=types.SimpleNamespace(
+                COUNT_PATHS=frozenset(), load_engines=dict, engine_for=lambda *_: None,
+            ),
         )
         exec(self.code, namespace)
         namespace['install_metrics_overlay']()
