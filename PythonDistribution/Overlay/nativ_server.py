@@ -1043,8 +1043,11 @@ class StreamAccumulator:
         self.prompt_tokens = int(usage.get("prompt_tokens") or self.prompt_tokens)
         self.completion_tokens = int(usage.get("completion_tokens") or self.completion_tokens)
         self.generated_tokens = int(usage.get("completion_tokens") or self.generated_tokens)
-        if usage.get("prompt_tps") is not None:
-            self.prefill_tok_s = float(usage["prompt_tps"])
+        prefill_tps = usage.get("prompt_tps")
+        if prefill_tps is None:
+            prefill_tps = timings.get("prompt_per_second")
+        if prefill_tps is not None and float(prefill_tps) > 0:
+            self.prefill_tok_s = float(prefill_tps)
         generation_tps = usage.get("generation_tps")
         if generation_tps is None:
             generation_tps = timings.get("predicted_per_second")
@@ -1099,6 +1102,14 @@ class StreamAccumulator:
         self.prompt_tokens = int(usage.get("input_tokens") or self.prompt_tokens)
         self.completion_tokens = int(usage.get("output_tokens") or self.completion_tokens)
         self.generated_tokens = int(usage.get("output_tokens") or self.generated_tokens)
+        # An external engine's figures arrive here; the bundled server's arrive in its metrics envelope.
+        timings = payload.get("timings") or {}
+        if (timings.get("prompt_per_second") or 0) > 0:
+            self.prefill_tok_s = float(timings["prompt_per_second"])
+        if (timings.get("predicted_per_second") or 0) > 0:
+            self.decode_tok_s = float(timings["predicted_per_second"])
+        if timings.get("peak_memory") is not None:
+            self.peak_memory_gb = float(timings["peak_memory"])
 
     def finalize(self) -> dict[str, Any]:
         elapsed = max(0.0, time.perf_counter() - self.observation.start_time)

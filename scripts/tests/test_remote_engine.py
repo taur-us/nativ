@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -611,6 +612,47 @@ class ExternalLoadGuardTests(unittest.TestCase):
 
     def test_asking_to_load_any_other_model_is_left_to_the_server(self):
         self.assertIsNone(self.module.external_load_reply("local-model", {}))
+
+
+class ForwardedSpeedAnalyticsTests(unittest.TestCase):
+    """The server's analytics record the speeds and memory an external engine reports with a streamed reply."""
+
+    TIMINGS = {"prompt_per_second": 223.7, "predicted_per_second": 44.7, "peak_memory": 19.46}
+
+    def record(self, kind, *blocks):
+        tree = ast.parse(SERVER_SOURCE.read_text())
+        accumulator = next(node for node in tree.body
+                           if isinstance(node, ast.ClassDef) and node.name == "StreamAccumulator")
+        namespace = {"json": json, "time": time, "Any": object, "RequestObservation": object}
+        exec(compile(ast.Module(body=[accumulator], type_ignores=[]), str(SERVER_SOURCE), "exec"), namespace)
+        observation = SimpleNamespace(model="qwen", start_time=time.perf_counter(), first_token_at=None)
+        stream = namespace["StreamAccumulator"](observation, kind)
+        for block in blocks:
+            stream.feed(block)
+        recorded = stream.finalize()
+        return {key: recorded[key] for key in ("prefill_tok_s", "decode_tok_s", "peak_memory_gb")}
+
+    def completed(self, **extra):
+        event = {"type": "response.completed", "response": {"usage": {"input_tokens": 337, "output_tokens": 69}}, **extra}
+        return f"event: response.completed\ndata: {json.dumps(event)}"
+
+    def test_a_responses_reply_records_the_engine_speeds_and_memory(self):
+        self.assertEqual(self.record("responses", self.completed(timings=self.TIMINGS)),
+                         {"prefill_tok_s": 223.7, "decode_tok_s": 44.7, "peak_memory_gb": 19.46})
+
+    def test_a_responses_reply_without_timings_records_none(self):
+        self.assertEqual(self.record("responses", self.completed()),
+                         {"prefill_tok_s": None, "decode_tok_s": None, "peak_memory_gb": None})
+
+    def test_a_zero_speed_does_not_replace_one_already_seen(self):
+        earlier = 'event: response.output_text.done\ndata: {"timings": {"predicted_per_second": 50.0}}'
+        recorded = self.record("responses", earlier, self.completed(timings={"predicted_per_second": 0}))
+        self.assertEqual(recorded["decode_tok_s"], 50.0)
+
+    def test_a_chat_reply_records_the_engine_prefill_speed(self):
+        chunk = {"choices": [], "usage": {"prompt_tokens": 19, "completion_tokens": 2}, "timings": self.TIMINGS}
+        self.assertEqual(self.record("chat", f"data: {json.dumps(chunk)}"),
+                         {"prefill_tok_s": 223.7, "decode_tok_s": 44.7, "peak_memory_gb": 19.46})
 
 
 class LoadGuardInstallTests(unittest.TestCase):
