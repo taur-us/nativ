@@ -19,6 +19,14 @@ NO_HUB_CACHE = "/nonexistent/huggingface/hub"
 ENGINE = {"base_url": "http://127.0.0.1:8091/v1", "model": "engine-model", "api_key": "secret"}
 
 
+def server_definition(name, namespace):
+    """One top-level function or class of nativ_server.py, run against stand-ins: the module itself needs MLX."""
+    node = next(node for node in ast.parse(SERVER_SOURCE.read_text()).body
+                if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == name)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SERVER_SOURCE), "exec"), namespace)
+    return namespace[name]
+
+
 class StubResponse:
     """Stands in for the fastapi response classes: keeps what it was built with."""
 
@@ -740,15 +748,12 @@ class ForwardedSpeedAnalyticsTests(unittest.TestCase):
     """The server's analytics record the speeds and memory an external engine reports with a streamed reply."""
 
     TIMINGS = {"prompt_per_second": 223.7, "predicted_per_second": 44.7, "peak_memory": 19.46}
+    PARSER_NAMES = {"json": json, "time": time, "Any": object, "RequestObservation": object}
 
     def record(self, kind, *blocks):
-        tree = ast.parse(SERVER_SOURCE.read_text())
-        accumulator = next(node for node in tree.body
-                           if isinstance(node, ast.ClassDef) and node.name == "StreamAccumulator")
-        namespace = {"json": json, "time": time, "Any": object, "RequestObservation": object}
-        exec(compile(ast.Module(body=[accumulator], type_ignores=[]), str(SERVER_SOURCE), "exec"), namespace)
+        accumulator = server_definition("StreamAccumulator", dict(self.PARSER_NAMES))
         observation = SimpleNamespace(model="qwen", start_time=time.perf_counter(), first_token_at=None)
-        stream = namespace["StreamAccumulator"](observation, kind)
+        stream = accumulator(observation, kind)
         for block in blocks:
             stream.feed(block)
         recorded = stream.finalize()
@@ -772,11 +777,8 @@ class ForwardedSpeedAnalyticsTests(unittest.TestCase):
         self.assertEqual(recorded["decode_tok_s"], 50.0)
 
     def parse(self, parser, body):
-        tree = ast.parse(SERVER_SOURCE.read_text())
-        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == parser)
-        namespace = {"json": json, "time": time, "Any": object, "RequestObservation": object}
-        exec(compile(ast.Module(body=[function], type_ignores=[]), str(SERVER_SOURCE), "exec"), namespace)
-        recorded = namespace[parser](json.dumps(body).encode(), SimpleNamespace(model="qwen", start_time=time.perf_counter()))
+        parse = server_definition(parser, dict(self.PARSER_NAMES))
+        recorded = parse(json.dumps(body).encode(), SimpleNamespace(model="qwen", start_time=time.perf_counter()))
         return {key: recorded[key] for key in ("prefill_tok_s", "decode_tok_s", "peak_memory_gb")}
 
     def test_replies_that_are_not_streamed_record_the_engine_speeds(self):
@@ -819,9 +821,6 @@ class LoadGuardInstallTests(unittest.TestCase):
     LIBRARY = {"mlx_vlm.utils": ("load_model",), "mlx_vlm.speculative.drafters": ("load_drafter",)}
 
     def install(self, app_names, package_names):
-        tree = ast.parse(SERVER_SOURCE.read_text())
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "install_remote_engine_load_guard")
         modules = {name: SimpleNamespace(**{loader: f"{name}.{loader}" for loader in loaders})
                    for name, loaders in self.LIBRARY.items()}
         app = SimpleNamespace(**{name: f"app.{name}" for name in app_names})
@@ -833,8 +832,7 @@ class LoadGuardInstallTests(unittest.TestCase):
             "remote_engine": SimpleNamespace(
                 refusing_external_loads=lambda loader, parameter: ("guarded", loader, parameter)),
         }
-        exec(compile(ast.Module(body=[function], type_ignores=[]), str(SERVER_SOURCE), "exec"), namespace)
-        namespace["install_remote_engine_load_guard"]()
+        server_definition("install_remote_engine_load_guard", namespace)()
         return app, package, modules
 
     def test_a_server_with_an_inner_loader_is_guarded_there_only(self):
@@ -860,6 +858,58 @@ class LoadGuardInstallTests(unittest.TestCase):
     def test_a_server_with_no_known_loader_stops_the_launch(self):
         with self.assertRaises(AttributeError):
             self.install((), ())
+
+
+class ServerWiringTests(unittest.TestCase):
+    """The server's start-up and its model load route really use the guard."""
+
+    def test_the_load_guard_is_in_place_before_the_server_starts(self):
+        steps = []
+        main = server_definition("main", {
+            "sys": SimpleNamespace(argv=["nativ_server"]),
+            "remote_engine": SimpleNamespace(without_remote_preload=lambda arguments, engines: arguments,
+                                             load_engines=lambda: {}),
+            "install_remote_engine_load_guard": lambda: steps.append("guard"),
+            "install_remote_engine_status": lambda: steps.append("status"),
+            "install_metrics_overlay": lambda: steps.append("metrics"),
+            "install_metrics_access_log_filter": lambda: None,
+            "base_cli": SimpleNamespace(argparse=SimpleNamespace(ArgumentParser=object)),
+            "base": SimpleNamespace(main=lambda: steps.append("serve")),
+            "SimpleNamespace": SimpleNamespace, "Any": object,
+        })
+        main()
+        self.assertLess(steps.index("guard"), steps.index("serve"))
+
+    def load_route(self):
+        """The real /v1/models/load handler, with a loader that records what reaches it."""
+        routes, loads = {}, []
+
+        def register(path, **options):
+            return lambda handler: routes.setdefault(path, handler)
+
+        app = SimpleNamespace(state=SimpleNamespace(), get=register, post=register,
+                              middleware=lambda kind: lambda handler: handler)
+        engine = load_module()
+        engine.listed_models = lambda *path: {"qwen": ENGINE}
+        server_definition("install_metrics_overlay", {
+            "base": SimpleNamespace(app=app, get_cached_model=lambda model, adapter=None: loads.append(model),
+                                    _require_management_api_key=lambda request: None),
+            "remote_engine": engine,
+            "install_base_metrics_capture": lambda: None,
+            "current_runtime_snapshot": lambda: {"loaded_model": "in-process", "loaded_models": {}},
+            "HTTPException": StubHTTPException, "Request": object, "Any": object,
+        })()
+        return routes["/v1/models/load"], loads
+
+    def test_loading_a_listed_model_succeeds_without_reaching_the_loader(self):
+        load, loads = self.load_route()
+        self.assertEqual(load(None, {"model": " qwen "}), {"status": "loaded", "model": "qwen", "loaded_models": {}})
+        self.assertEqual(loads, [])
+
+    def test_loading_any_other_model_reaches_the_loader(self):
+        load, loads = self.load_route()
+        self.assertEqual(load(None, {"model": "other"})["model"], "in-process")
+        self.assertEqual(loads, ["other"])
 
 
 def summary_reply(text="SUM"):
