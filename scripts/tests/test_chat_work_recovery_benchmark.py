@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.benchmarks.chat_work_recovery.benchmark import grade
+sys.path.pop(0)
 
 
 class ChatBrowserBenchmarkGradingTests(unittest.TestCase):
