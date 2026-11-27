@@ -935,6 +935,106 @@ class CompactionForwardTests(unittest.TestCase):
         self.assertEqual(StubClient.sent[0].json["input"][-1]["content"], "newer")
 
 
+def excerpts(*notes, max_bytes=4000):
+    return {"max_bytes": max_bytes, "entries": [{"tool_call_id": call, "text": text} for call, text in notes]}
+
+
+class RequestContextTests(unittest.TestCase):
+    """Nativ sends two request-local fields that its bundled server writes into the prompt. Other engines
+    ignore them, so the forwarder has to place their text itself."""
+
+    def setUp(self):
+        self.module = load_module()
+        StubClient.sent, StubClient.script, StubClient.posted, StubClient.post_script = [], [], [], []
+
+    def sent(self, payload, path="/v1/responses"):
+        request = SimpleNamespace(url=SimpleNamespace(path=path), headers={})
+        StubClient.script = [UpstreamResponse()]
+        asyncio.run(self.module.forward(request, {"model": "qwen", **payload}, ENGINE))
+        return StubClient.sent[-1].json
+
+    def test_the_current_environment_text_is_the_last_message_the_engine_sees(self):
+        body = self.sent({"input": history(), "transient_context": "DOCUMENT EXCERPT"})
+        self.assertEqual(body["input"][-1], {"type": "message", "role": "user", "content": "DOCUMENT EXCERPT"})
+        self.assertEqual(len(body["input"]), len(history()) + 1)
+        self.assertNotIn("transient_context", body)
+
+    def test_a_chat_completions_request_gets_the_environment_text_as_a_chat_message(self):
+        messages = [{"role": "user", "content": "hi"}]
+        body = self.sent({"messages": messages, "transient_context": "NOW"}, "/v1/chat/completions")
+        self.assertEqual(body["messages"], messages + [{"role": "user", "content": "NOW"}])
+        self.assertNotIn("transient_context", body)
+
+    def test_a_request_with_a_plain_string_input_keeps_it_ahead_of_the_environment_text(self):
+        body = self.sent({"input": "question", "transient_context": "NOW"})
+        self.assertEqual([item["content"] for item in body["input"]], ["question", "NOW"])
+
+    def test_excerpts_are_restored_ahead_of_the_history_only_for_results_no_longer_in_it(self):
+        body = self.sent({"input": history(), "tool_result_context": excerpts(("gone", "LOST FACT"), ("c2", "STILL THERE"))})
+        first = body["input"][0]
+        self.assertEqual(first["role"], "user")
+        self.assertTrue(first["content"].startswith(self.module.RECOVERY_HEADING))
+        self.assertIn("LOST FACT", first["content"])
+        self.assertNotIn("STILL THERE", first["content"])
+        self.assertNotIn("tool_result_context", body)
+
+    def test_a_result_that_compaction_cleared_counts_as_no_longer_in_the_history(self):
+        cleared = self.module.clear_old_outputs(history(), len(history()))
+        body = self.sent({"input": cleared, "tool_result_context": excerpts(("c1", "CLEARED FACT"))})
+        self.assertIn("CLEARED FACT", body["input"][0]["content"])
+
+    def test_chat_excerpts_follow_the_system_message_and_skip_results_still_present(self):
+        messages = [{"role": "system", "content": "rules"}, {"role": "tool", "tool_call_id": "c9", "content": "seen"},
+                    {"role": "user", "content": "hi"}]
+        body = self.sent({"messages": messages, "tool_result_context": excerpts(("gone", "LOST"), ("c9", "SEEN"))},
+                         "/v1/chat/completions")
+        self.assertEqual(body["messages"][0], messages[0])
+        self.assertIn("LOST", body["messages"][1]["content"])
+        self.assertNotIn("SEEN", body["messages"][1]["content"])
+        self.assertEqual(body["messages"][2:], messages[1:])
+
+    def test_excerpts_are_trimmed_and_then_dropped_to_stay_inside_the_apps_byte_budget(self):
+        notes = [(f"gone{number}", f"note{number} " + "z" * 2000) for number in range(12)]
+        text = self.sent({"input": history(), "tool_result_context": excerpts(*notes, max_bytes=600)})["input"][0]["content"]
+        self.assertLessEqual(len(text.encode()), 600)
+        self.assertIn("note0", text)
+        self.assertNotIn("note11", text)
+
+    def test_excerpts_for_results_all_still_present_add_nothing(self):
+        body = self.sent({"input": history(), "tool_result_context": excerpts(("c1", "A"), ("c2", "B"))})
+        self.assertEqual(len(body["input"]), len(history()))
+
+    def test_a_malformed_context_field_is_dropped_without_failing_the_request(self):
+        for field in ("text", {"entries": "x"}, {"entries": [None, {"tool_call_id": "a"}]}, 5):
+            with self.subTest(field=field):
+                body = self.sent({"input": history(), "tool_result_context": field, "transient_context": {"not": "text"}})
+                self.assertEqual(len(body["input"]), len(history()))
+
+    def test_the_token_count_includes_both_blocks_where_generation_puts_them(self):
+        StubClient.post_script = [JSONReply({"prompt": "p"}), JSONReply({"tokens": [1]})]
+        payload = {"model": "qwen", "input": [{"type": "message", "role": "user", "content": "hi"}],
+                   "transient_context": "NOW", "tool_result_context": excerpts(("gone", "LOST"))}
+        asyncio.run(self.module.count_input_tokens(payload, ENGINE))
+        contents = [message["content"] for message in StubClient.posted[0].json["messages"]]
+        self.assertIn("LOST", contents[0])
+        self.assertEqual(contents[1:], ["hi", "NOW"])
+
+    def test_neither_block_is_sealed_into_a_compaction_item_and_the_summary_keeps_the_cached_prefix(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        StubClient.script = [UpstreamResponse(body=json.dumps({"output": [], "usage": {"input_tokens": 1000}}).encode())]
+        StubClient.post_script = [summary_reply()]
+        payload = {"model": "qwen", "input": chat_history(), "transient_context": "NOW STATE",
+                   "tool_result_context": excerpts(("gone", "LOST FACT")),
+                   "context_management": [{"type": "compaction", "compact_threshold": 500}]}
+        response = asyncio.run(self.module.forward(request, payload, ENGINE))
+        sent, summary = StubClient.sent[-1].json["input"], StubClient.posted[0].json["input"]
+        self.assertEqual(summary[:-1], sent[:-1])  # everything but the current-state block is the prompt just answered
+        self.assertNotIn("NOW STATE", json.dumps(summary))
+        capsule = json.dumps(self.module.expand_compaction(json.loads(response.content)["output"][-1:]))
+        self.assertNotIn("NOW STATE", capsule)
+        self.assertNotIn("LOST FACT", capsule)
+
+
 class CompactionRobustnessTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
