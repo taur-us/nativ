@@ -275,6 +275,17 @@ class ResponsesTranslationTests(unittest.TestCase):
         self.assertEqual(result["tools"], [{"type": "function", "name": "read_file", "description": "d",
                                             "parameters": {"type": "object"}}, flat])
 
+    def test_a_response_format_becomes_the_text_format_engines_read(self):
+        schema = {"name": "answer", "strict": True, "schema": {"type": "object"}}
+        result = self.convert(response_format={"type": "json_schema", "json_schema": schema}, text={"verbosity": "low"})
+        self.assertEqual(result["text"], {"verbosity": "low", "format": {"type": "json_schema", **schema}})
+        self.assertNotIn("response_format", result)
+        self.assertEqual(self.convert(response_format={"type": "json_object"})["text"], {"format": {"type": "json_object"}})
+
+    def test_an_empty_response_format_leaves_the_text_format_alone(self):
+        text = {"format": {"type": "json_object"}}
+        self.assertEqual(self.convert(response_format=None, text=text), {"text": text})
+
     def test_other_fields_and_non_message_items_pass_through(self):
         body = {"model": "m", "stream": True, "input": [{"type": "function_call_output", "call_id": "c", "output": "x"}]}
         self.assertEqual(self.convert(**body), body)

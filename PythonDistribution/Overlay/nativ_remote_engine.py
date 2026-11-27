@@ -182,8 +182,14 @@ def _input_items(item: Any) -> Iterator[Any]:
 def responses_body_for_engine(body: dict[str, Any]) -> dict[str, Any]:
     """Rewrite Nativ's Responses request, which follows the bundled server's chat-style extensions,
     into the standard shape: tool results as function_call_output, assistant tool calls as
-    function_call items, and flat tool definitions."""
+    function_call items, flat tool definitions, and the output format as `text.format`."""
     converted = dict(body)
+    # The bundled server reads `response_format` here too, ahead of `text.format`; engines read only the latter.
+    chosen = converted.pop("response_format", None)
+    if isinstance(chosen, dict):
+        schema, text = chosen.get("json_schema"), converted.get("text")
+        converted["text"] = {**(text if isinstance(text, dict) else {}),
+                             "format": {"type": chosen.get("type"), **(schema if isinstance(schema, dict) else {})}}
     if isinstance(converted.get("input"), list):
         converted["input"] = [engine_item for item in expand_compaction(converted["input"]) for engine_item in _input_items(item)]
     if isinstance(converted.get("tools"), list):
