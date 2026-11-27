@@ -52,6 +52,8 @@ SEND_ATTEMPTS = 2
 # Answers a route that would have loaded an externally served model in-process.
 NOT_LOADED_HERE = ("{model} is served by an external engine, so Nativ does not load it. "
                    "Only Chat Completions and Responses requests reach that engine.")
+LIST_UNKNOWN = ("{path} cannot be read, so Nativ cannot tell which models an external engine serves and loads none. "
+                "Fix the file, or move it aside to turn forwarding off.")
 
 SSE_EVENT_END = b"\n\n"
 # A comment line: the app's stream readers skip it, and it keeps an idle stream from timing out.
@@ -119,22 +121,34 @@ STATUS_TIMEOUT_S = 2
 _client: httpx.AsyncClient | None = None
 _ready_engines: dict[str, dict[str, Any]] = {}
 _ready_lock = threading.Lock()
+# What each engines file last named, so that a file caught half way through an edit changes nothing.
+_last_listed: dict[str, dict[str, Any]] = {}
 _refresher: threading.Thread | None = None
 
 
-def load_engines(path: str = ENGINES_PATH) -> dict[str, dict[str, str]]:
-    """Read the model-to-engine map. A missing or unreadable file means no remote engines."""
+def listed_models(path: str = ENGINES_PATH) -> dict[str, Any] | None:
+    """Every model the engines file names, whether or not its entry is usable. A missing file names none. A file that
+    cannot be read still names what it did when last read; None if it never has been, so nothing is known."""
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
     except FileNotFoundError:
+        _last_listed.pop(path, None)
         return {}
     except (OSError, ValueError) as error:
         log.warning("remote engines file unreadable: %s", error)
-        return {}
+        return _last_listed.get(path)
+    _last_listed[path] = data
+    return data
+
+
+def load_engines(path: str = ENGINES_PATH) -> dict[str, dict[str, str]]:
+    """The model-to-engine map: the listed models whose entry says where their engine is."""
     return {
         model: engine
-        for model, engine in data.items()
+        for model, engine in (listed_models(path) or {}).items()
         if isinstance(engine, dict) and isinstance(engine.get("base_url"), str)
     }
 
@@ -147,11 +161,20 @@ def engine_for(payload: Any, engines: dict[str, dict[str, str]]) -> dict[str, st
     return engines.get(model) if isinstance(model, str) else None
 
 
+def require_loadable(source: Any) -> None:
+    """Raise unless this server may load `source`: never a listed model, and nothing at all while which models are
+    listed cannot be told."""
+    listed = listed_models()
+    if listed is None:
+        raise HTTPException(status_code=503, detail=LIST_UNKNOWN.format(path=ENGINES_PATH))
+    if source in listed:
+        raise HTTPException(status_code=501, detail=NOT_LOADED_HERE.format(model=source))
+
+
 def refusing_external_loads(loader: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap the bundled server's model loader so a mapped model is never loaded in-process, whichever route asks."""
+    """Wrap the bundled server's model loader so a listed model is never loaded in-process, whichever route asks."""
     def guarded(model_path: str, *args: Any, **kwargs: Any) -> Any:
-        if engine_for({"model": model_path}, load_engines()) is not None:
-            raise HTTPException(status_code=501, detail=NOT_LOADED_HERE.format(model=model_path))
+        require_loadable(model_path)
         return loader(model_path, *args, **kwargs)
 
     return guarded

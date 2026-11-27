@@ -158,6 +158,31 @@ class EnginesFileTests(unittest.TestCase):
         path = self.write(json.dumps({"a": {"base_url": "http://x/v1"}, "b": {"model": "m"}, "c": 3}))
         self.assertEqual(list(self.module.load_engines(path)), ["a"])
 
+    def test_a_model_whose_entry_is_unusable_is_still_listed(self):
+        path = self.write(json.dumps({"qwen": {"base-url": "http://x/v1"}}))
+        self.assertEqual(list(self.module.listed_models(path)), ["qwen"])
+
+    def test_a_file_that_turns_unreadable_keeps_what_it_listed(self):
+        path = self.write(json.dumps({"qwen": ENGINE}))
+        self.module.load_engines(path)
+        for broken in ("{half way through an edit", "", "[]"):
+            with self.subTest(broken=broken):
+                self.write(broken)
+                self.assertEqual(self.module.load_engines(path), {"qwen": ENGINE})
+                self.assertEqual(list(self.module.listed_models(path)), ["qwen"])
+
+    def test_a_file_never_read_successfully_leaves_the_list_unknown(self):
+        for broken in ("{not json", "[]"):
+            with self.subTest(broken=broken):
+                self.assertIsNone(self.module.listed_models(self.write(broken)))
+
+    def test_removing_the_file_lists_nothing(self):
+        path = self.write(json.dumps({"qwen": ENGINE}))
+        self.module.load_engines(path)
+        os.remove(path)
+        self.assertEqual(self.module.listed_models(path), {})
+        self.assertEqual(self.module.load_engines(path), {})
+
 
 class RoutingTests(unittest.TestCase):
     def setUp(self):
@@ -585,7 +610,8 @@ class RemoteModelStatusTests(unittest.TestCase):
 class ExternalLoadGuardTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
-        self.module.load_engines = lambda: {"qwen": {"base_url": "http://127.0.0.1:8091/v1"}}
+        self.listed = {"qwen": {"base_url": "http://127.0.0.1:8091/v1"}}
+        self.module.listed_models = lambda *path: self.listed
         self.loaded = []
         self.guarded = self.module.refusing_external_loads(
             lambda *args, **kwargs: self.loaded.append((args, kwargs)) or "resources")
@@ -600,6 +626,20 @@ class ExternalLoadGuardTests(unittest.TestCase):
     def test_a_mapped_model_named_by_keyword_is_refused_too(self):
         with self.assertRaises(StubHTTPException):
             self.guarded(model_path="qwen")
+        self.assertEqual(self.loaded, [])
+
+    def test_a_listed_model_whose_entry_is_unusable_is_refused(self):
+        self.listed = {"qwen": {"base-url": "http://127.0.0.1:8091/v1"}}
+        with self.assertRaises(StubHTTPException):
+            self.guarded("qwen")
+        self.assertEqual(self.loaded, [])
+
+    def test_nothing_loads_while_the_listed_models_are_unknown(self):
+        self.listed = None
+        with self.assertRaises(StubHTTPException) as refused:
+            self.guarded("any-model")
+        self.assertEqual(refused.exception.status_code, 503)
+        self.assertIn("remote-engines.json", refused.exception.detail)
         self.assertEqual(self.loaded, [])
 
     def test_other_models_load_with_their_arguments_unchanged(self):

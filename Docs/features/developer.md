@@ -89,7 +89,11 @@ as before. The file is read per request, so edits apply without a restart.
   reported while a model is loaded or loading in-process, so with several engines or a mixed setup the app
   may size its threshold from another model's context. A chat whose stored compaction item came from another server (for example an in-process
   compaction made before the model was listed here) carries on without it, with a note saying so.
-- A listed model is never loaded in-process, including at start-up when it is the active model.
+- A listed model is never loaded in-process, including at start-up when it is the active model. That
+  holds for every model the engines file names, even one whose entry has a mistake in it. If the file
+  stops being readable, for instance half way through an edit, the server keeps what it last read. If it
+  has never been readable, the server cannot tell which models are external, so it loads none until the
+  file is fixed. Removing the file turns forwarding off.
   `/v1/models/load` answers that it is loaded without doing anything, which is what the Integrations tab
   needs. Any other route that would load it, such as the Anthropic Messages API, answers with an error
   (501 from the loader, which a route may report under its own status). So an integration that only speaks
