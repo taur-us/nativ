@@ -84,7 +84,8 @@ as before. The file is read per request, so edits apply without a restart.
   summary fails, the chat continues uncompacted.
 - While an engine's `/status` reports it ready, `/health` and `/metrics` show the listed model as loaded
   with the engine's context size, so the app sizes its compaction threshold from it. The engine's
-  `/metrics` memory in use is passed to the app as the peak-memory figure (the engine has no per-reply peak).
+  `/metrics` memory in use is passed to the app as the peak-memory figure (the engine has no per-reply peak),
+  and analytics store it as that reply's peak memory.
   `/health` also says that model is ready. Only the first ready engine is reported as loaded, and nothing is
   reported while a model is loaded or loading in-process, so with several engines or a mixed setup the app
   may size its threshold from another model's context. A chat whose stored compaction item came from another server (for example an in-process

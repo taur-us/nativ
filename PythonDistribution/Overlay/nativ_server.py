@@ -1043,9 +1043,7 @@ class StreamAccumulator:
         self.prompt_tokens = int(usage.get("prompt_tokens") or self.prompt_tokens)
         self.completion_tokens = int(usage.get("completion_tokens") or self.completion_tokens)
         self.generated_tokens = int(usage.get("completion_tokens") or self.generated_tokens)
-        prefill_tps = usage.get("prompt_tps")
-        if prefill_tps is None:
-            prefill_tps = timings.get("prompt_per_second")
+        prefill_tps = usage.get("prompt_tps") or timings.get("prompt_per_second")
         if prefill_tps is not None and float(prefill_tps) > 0:
             self.prefill_tok_s = float(prefill_tps)
         generation_tps = usage.get("generation_tps")
@@ -1149,8 +1147,8 @@ def parse_chat_response(body: bytes, observation: RequestObservation) -> dict[st
     elapsed = max(0.0, time.perf_counter() - observation.start_time)
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
     completion_tokens = int(usage.get("completion_tokens") or 0)
-    prompt_tps = usage.get("prompt_tps")
-    generation_tps = usage.get("generation_tps")
+    prompt_tps = usage.get("prompt_tps") or timings.get("prompt_per_second") or None
+    generation_tps = usage.get("generation_tps") or timings.get("predicted_per_second") or None
     prompt_eval_time = (
         prompt_tokens / float(prompt_tps)
         if prompt_tps and float(prompt_tps) > 0 and prompt_tokens > 0
@@ -1187,6 +1185,7 @@ def parse_chat_response(body: bytes, observation: RequestObservation) -> dict[st
 def parse_responses_body(body: bytes, observation: RequestObservation) -> dict[str, Any]:
     payload = json.loads(body.decode("utf-8"))
     usage = payload.get("usage") or {}
+    timings = payload.get("timings") or {}
     elapsed = max(0.0, time.perf_counter() - observation.start_time)
     prompt_tokens = int(usage.get("input_tokens") or 0)
     completion_tokens = int(usage.get("output_tokens") or 0)
@@ -1199,11 +1198,11 @@ def parse_responses_body(body: bytes, observation: RequestObservation) -> dict[s
         "request_tok_s": (
             completion_tokens / elapsed if elapsed > 0 and completion_tokens > 0 else None
         ),
-        "decode_tok_s": None,
+        "decode_tok_s": timings.get("predicted_per_second") or None,
         "prompt_eval_time_s": None,
-        "prefill_tok_s": None,
+        "prefill_tok_s": timings.get("prompt_per_second") or None,
         "ttft_s": None,
-        "peak_memory_gb": None,
+        "peak_memory_gb": timings.get("peak_memory"),
         "finish_reason": "stop",
         "tool_calls": False,
     }

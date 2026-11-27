@@ -771,6 +771,42 @@ class ForwardedSpeedAnalyticsTests(unittest.TestCase):
         recorded = self.record("responses", earlier, self.completed(timings={"predicted_per_second": 0}))
         self.assertEqual(recorded["decode_tok_s"], 50.0)
 
+    def parse(self, parser, body):
+        tree = ast.parse(SERVER_SOURCE.read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == parser)
+        namespace = {"json": json, "time": time, "Any": object, "RequestObservation": object}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(SERVER_SOURCE), "exec"), namespace)
+        recorded = namespace[parser](json.dumps(body).encode(), SimpleNamespace(model="qwen", start_time=time.perf_counter()))
+        return {key: recorded[key] for key in ("prefill_tok_s", "decode_tok_s", "peak_memory_gb")}
+
+    def test_replies_that_are_not_streamed_record_the_engine_speeds(self):
+        for parser in ("parse_chat_response", "parse_responses_body"):
+            with self.subTest(parser=parser):
+                self.assertEqual(self.parse(parser, {"usage": {}, "timings": self.TIMINGS}),
+                                 {"prefill_tok_s": 223.7, "decode_tok_s": 44.7, "peak_memory_gb": 19.46})
+
+    def test_a_speed_the_engine_did_not_measure_is_recorded_as_unknown(self):
+        unmeasured = {"prompt_per_second": 0.0, "predicted_per_second": 0.0}
+        for parser in ("parse_chat_response", "parse_responses_body"):
+            with self.subTest(parser=parser):
+                self.assertEqual(self.parse(parser, {"usage": {}, "timings": unmeasured}),
+                                 {"prefill_tok_s": None, "decode_tok_s": None, "peak_memory_gb": None})
+
+    def test_replies_without_timings_still_parse(self):
+        for parser in ("parse_chat_response", "parse_responses_body"):
+            with self.subTest(parser=parser):
+                self.assertEqual(self.parse(parser, {"usage": {}}),
+                                 {"prefill_tok_s": None, "decode_tok_s": None, "peak_memory_gb": None})
+
+    def test_a_zero_chat_prefill_speed_does_not_replace_one_already_seen(self):
+        seen = json.dumps({"choices": [], "timings": {"prompt_per_second": 100.0}})
+        unmeasured = json.dumps({"choices": [], "timings": {"prompt_per_second": 0.0}})
+        self.assertEqual(self.record("chat", f"data: {seen}", f"data: {unmeasured}")["prefill_tok_s"], 100.0)
+
+    def test_a_zero_in_chat_usage_falls_back_to_the_timings(self):
+        chunk = {"choices": [], "usage": {"prompt_tps": 0}, "timings": self.TIMINGS}
+        self.assertEqual(self.record("chat", f"data: {json.dumps(chunk)}")["prefill_tok_s"], 223.7)
+
     def test_a_chat_reply_records_the_engine_prefill_speed(self):
         chunk = {"choices": [], "usage": {"prompt_tokens": 19, "completion_tokens": 2}, "timings": self.TIMINGS}
         self.assertEqual(self.record("chat", f"data: {json.dumps(chunk)}"),
