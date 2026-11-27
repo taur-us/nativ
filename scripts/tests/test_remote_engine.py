@@ -1035,6 +1035,48 @@ class RequestContextTests(unittest.TestCase):
         self.assertNotIn("LOST FACT", capsule)
 
 
+class ThinkingSettingsTests(unittest.TestCase):
+    """The app names its thinking settings at the top level; engines read them elsewhere and ignore those names."""
+
+    def setUp(self):
+        self.module = load_module()
+        StubClient.sent, StubClient.script, StubClient.posted, StubClient.post_script = [], [], [], []
+
+    def sent(self, payload, path):
+        request = SimpleNamespace(url=SimpleNamespace(path=path), headers={})
+        StubClient.script = [UpstreamResponse()]
+        conversation = {"input": history(), "messages": [{"role": "user", "content": "hi"}]}
+        asyncio.run(self.module.forward(request, {"model": "qwen", **conversation, **payload}, ENGINE))
+        return StubClient.sent[-1].json
+
+    def test_the_thinking_switch_reaches_the_chat_template_on_both_routes(self):
+        for path in ("/v1/responses", "/v1/chat/completions"):
+            for enabled in (True, False):
+                with self.subTest(path=path, enabled=enabled):
+                    body = self.sent({"enable_thinking": enabled}, path)
+                    self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": enabled})
+                    self.assertNotIn("enable_thinking", body)
+
+    def test_the_apps_switch_wins_and_other_template_arguments_are_kept(self):
+        body = self.sent({"enable_thinking": False,
+                          "chat_template_kwargs": {"enable_thinking": True, "custom": 1}}, "/v1/responses")
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False, "custom": 1})
+
+    def test_the_thinking_budget_is_sent_under_the_engines_name(self):
+        body = self.sent({"thinking_budget": 512}, "/v1/responses")
+        self.assertEqual(body["thinking_token_budget"], 512)
+        self.assertNotIn("thinking_budget", body)
+
+    def test_a_budget_the_client_already_named_for_the_engine_is_kept(self):
+        body = self.sent({"thinking_budget": 512, "thinking_token_budget": 64}, "/v1/chat/completions")
+        self.assertEqual(body["thinking_token_budget"], 64)
+
+    def test_a_request_without_thinking_settings_gains_none(self):
+        body = self.sent({"enable_thinking": None}, "/v1/responses")
+        for field in ("chat_template_kwargs", "thinking_token_budget", "enable_thinking"):
+            self.assertNotIn(field, body)
+
+
 class CompactionRobustnessTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()

@@ -191,6 +191,21 @@ def responses_body_for_engine(body: dict[str, Any]) -> dict[str, Any]:
     return converted
 
 
+def with_engine_thinking(body: dict[str, Any]) -> dict[str, Any]:
+    """Rename the app's thinking settings, which its bundled server reads at the top level, to what engines read: the
+    switch as a chat template argument and the budget as `thinking_token_budget`."""
+    converted = dict(body)
+    enabled = converted.pop("enable_thinking", None)
+    if isinstance(enabled, bool):
+        arguments = converted.get("chat_template_kwargs")
+        converted["chat_template_kwargs"] = {**(arguments if isinstance(arguments, dict) else {}),
+                                             "enable_thinking": enabled}
+    budget = converted.pop("thinking_budget", None)
+    if isinstance(budget, int):
+        converted.setdefault("thinking_token_budget", budget)
+    return converted
+
+
 def _holds_result(item: Any) -> bool:
     """True when the item still shows the model a tool result, in either request shape."""
     if not isinstance(item, dict):
@@ -802,7 +817,8 @@ async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str])
                        "type": "not_implemented"}},
             status_code=501,
         )
-    body = {key: value for key, value in payload.items() if key not in (TRANSIENT_FIELD, RECOVERY_FIELD)}
+    body = with_engine_thinking(
+        {key: value for key, value in payload.items() if key not in (TRANSIENT_FIELD, RECOVERY_FIELD)})
     body["model"] = engine.get("model", payload["model"])
     threshold = compaction_threshold(body) if path == "/responses" else None
     if path == "/responses":
