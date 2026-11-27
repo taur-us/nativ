@@ -94,6 +94,8 @@ as before. The file is read per request, so edits apply without a restart.
   stops being readable, for instance half way through an edit, the server keeps what it last read. If it
   has never been readable, the server cannot tell which models are external, so it loads none until the
   file is fixed. Removing the file turns forwarding off.
+- A listed model is recognised by its files as well as its name: its id in another letter case, a path
+  into its Hugging Face cache folder, or a link to that folder is forwarded like the id, or refused.
   `/v1/models/load` answers that it is loaded without doing anything, which is what the Integrations tab
   needs. Any other route that would load it, such as the Anthropic Messages API, answers with an error
   (501 from the loader, which a route may report under its own status). So an integration that only speaks

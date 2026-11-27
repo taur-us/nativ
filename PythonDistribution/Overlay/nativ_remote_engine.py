@@ -23,11 +23,13 @@ import time
 import urllib.request
 import uuid
 from functools import partial
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
+from pathlib import Path
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator
 
 import httpx
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from huggingface_hub import constants as hub_constants
 
 log = logging.getLogger("nativ.remote_engine")
 
@@ -153,12 +155,52 @@ def load_engines(path: str = ENGINES_PATH) -> dict[str, dict[str, str]]:
     }
 
 
+def _identity(path: str | Path) -> tuple[int, int] | None:
+    """What a path points at, so two spellings of one folder, or a link to it, compare equal; None if nothing is there."""
+    try:
+        status = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return status.st_dev, status.st_ino
+
+
+def _source_path(source: str) -> str:
+    """Where a loader reads `source` from: the path itself when it exists, else its Hugging Face cache folder."""
+    path = os.path.expanduser(source)
+    if os.path.exists(path):
+        return path
+    return os.path.join(hub_constants.HF_HUB_CACHE, "models--" + source.replace("/", "--"))
+
+
+def listed_model(source: Any, listed: Iterable[str]) -> str | None:
+    """The listed model whose files loading `source`, a model id or a path, would read, however it is written."""
+    if not isinstance(source, (str, os.PathLike)):
+        return None
+    name = os.fspath(source)
+    folders = {}
+    for model in listed:
+        if model.casefold() == name.casefold():
+            return model
+        identity = _identity(_source_path(model))
+        if identity is not None:
+            folders[identity] = model
+    if not folders or not name:
+        return None
+    path = Path(_source_path(name))
+    # Both spellings: a cache folder is often a link, and a path can reach the files from either side of it.
+    for reading in (path.absolute(), path.resolve()):
+        for part in (reading, *reading.parents):
+            model = folders.get(_identity(part))
+            if model is not None:
+                return model
+    return None
+
+
 def engine_for(payload: Any, engines: dict[str, dict[str, str]]) -> dict[str, str] | None:
     """Return the engine that serves the request's model, or None to serve it in-process."""
     if not isinstance(payload, dict):
         return None
-    model = payload.get("model")
-    return engines.get(model) if isinstance(model, str) else None
+    return engines.get(listed_model(payload.get("model"), engines))
 
 
 def require_loadable(source: Any) -> None:
@@ -167,8 +209,9 @@ def require_loadable(source: Any) -> None:
     listed = listed_models()
     if listed is None:
         raise HTTPException(status_code=503, detail=LIST_UNKNOWN.format(path=ENGINES_PATH))
-    if source in listed:
-        raise HTTPException(status_code=501, detail=NOT_LOADED_HERE.format(model=source))
+    model = listed_model(source, listed)
+    if model is not None:
+        raise HTTPException(status_code=501, detail=NOT_LOADED_HERE.format(model=model))
 
 
 def refusing_external_loads(loader: Callable[..., Any]) -> Callable[..., Any]:
@@ -370,9 +413,10 @@ def without_remote_preload(arguments: list[str], engines: dict[str, dict[str, st
     position = 0
     while position < len(arguments):
         argument = arguments[position]
-        if argument == "--model" and position + 1 < len(arguments) and arguments[position + 1] in engines:
+        if (argument == "--model" and position + 1 < len(arguments)
+                and engine_for({"model": arguments[position + 1]}, engines) is not None):
             position += 2
-        elif argument.startswith("--model=") and argument.removeprefix("--model=") in engines:
+        elif argument.startswith("--model=") and engine_for({"model": argument.removeprefix("--model=")}, engines) is not None:
             position += 1
         else:
             result.append(argument)

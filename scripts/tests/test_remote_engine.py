@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 SOURCE = Path(__file__).resolve().parents[2] / "PythonDistribution/Overlay/nativ_remote_engine.py"
 SERVER_SOURCE = SOURCE.with_name("nativ_server.py")
+NO_HUB_CACHE = "/nonexistent/huggingface/hub"
 ENGINE = {"base_url": "http://127.0.0.1:8091/v1", "model": "engine-model", "api_key": "secret"}
 
 
@@ -128,6 +129,7 @@ def load_module():
             TransportError=StubTransportError, InvalidURL=StubInvalidURL, Response=UpstreamResponse,
         ),
         "fastapi": SimpleNamespace(HTTPException=StubHTTPException),
+        "huggingface_hub": SimpleNamespace(constants=SimpleNamespace(HF_HUB_CACHE=NO_HUB_CACHE)),
         "fastapi.responses": SimpleNamespace(JSONResponse=StubResponse, Response=StubResponse, StreamingResponse=StubResponse),
     }
     spec = importlib.util.spec_from_file_location("nativ_remote_engine_under_test", SOURCE)
@@ -182,6 +184,71 @@ class EnginesFileTests(unittest.TestCase):
         os.remove(path)
         self.assertEqual(self.module.listed_models(path), {})
         self.assertEqual(self.module.load_engines(path), {})
+
+
+class ListedWeightsTests(unittest.TestCase):
+    """A listed model is the same model however a request names its files."""
+
+    LISTED = "local/Qwen"
+
+    def setUp(self):
+        self.module = load_module()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        # Like the real layout: the Hugging Face cache folder is a link into the engine's own cache.
+        self.weights = self.root / "engine" / "models--local--Qwen"
+        self.snapshot = self.weights / "snapshots" / "abc"
+        self.snapshot.mkdir(parents=True)
+        (self.snapshot / "model.safetensors").write_text("weights")
+        self.cache = self.root / "hub"
+        self.cache.mkdir()
+        self.cached = self.cache / "models--local--Qwen"
+        self.cached.symlink_to(self.weights)
+        self.module.hub_constants = SimpleNamespace(HF_HUB_CACHE=str(self.cache))
+        self.engines = {self.LISTED: ENGINE}
+
+    def assert_listed(self, *sources):
+        for source in sources:
+            with self.subTest(source=str(source)):
+                self.assertEqual(self.module.listed_model(source, self.engines), self.LISTED)
+
+    def test_the_id_in_another_letter_case_is_the_listed_model(self):
+        self.assert_listed("LOCAL/qwen", "local/QWEN")
+
+    def test_a_folder_or_file_among_its_weights_is_the_listed_model(self):
+        self.assert_listed(str(self.cached / "snapshots" / "abc"), str(self.cached), str(self.snapshot),
+                           self.snapshot, str(self.snapshot / "model.safetensors"))
+
+    def test_a_link_into_its_weights_is_the_listed_model(self):
+        (self.root / "shortcut").symlink_to(self.snapshot)
+        (self.cache / "models--org--Alias").symlink_to(self.weights)
+        self.assert_listed(str(self.root / "shortcut"), "org/Alias")
+
+    def test_other_models_folders_and_values_are_not(self):
+        (self.cache / "models--local--Other").mkdir()
+        for source in ("local/Other", "unknown/model", str(self.cache), str(self.root / "engine"), "", None, 3):
+            with self.subTest(source=source):
+                self.assertIsNone(self.module.listed_model(source, self.engines))
+
+    def test_a_listed_model_with_no_files_here_still_matches_its_id(self):
+        self.assertEqual(self.module.listed_model("ORG/remote", {"org/remote": ENGINE}), "org/remote")
+        self.assertIsNone(self.module.listed_model("local/Qwen", {"org/remote": ENGINE}))
+
+    def test_its_snapshot_path_is_forwarded_to_its_engine(self):
+        self.assertIs(self.module.engine_for({"model": str(self.snapshot)}, self.engines), ENGINE)
+
+    def test_its_snapshot_path_is_not_preloaded(self):
+        for arguments in (["--model", str(self.snapshot)], [f"--model={self.snapshot}"]):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.module.without_remote_preload(arguments, self.engines), [])
+
+    def test_its_snapshot_path_is_not_loaded(self):
+        self.module.listed_models = lambda *path: self.engines
+        with self.assertRaises(StubHTTPException) as refused:
+            self.module.require_loadable(self.snapshot)
+        self.assertEqual(refused.exception.status_code, 501)
+        self.assertIn(self.LISTED, refused.exception.detail)
 
 
 class RoutingTests(unittest.TestCase):
