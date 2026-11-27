@@ -65,7 +65,10 @@ as before. The file is read per request, so edits apply without a restart.
 - When there is current state to send, the engine first gets the conversation without it, capped at one
   output token. Splash keeps reusable state only at the end of a prompt, so without this the next turn
   would diverge before that point and re-read the whole conversation. The extra request does the reading
-  the real one would have done, so only the current state is read twice over successive turns.
+  the real one would otherwise have done.
+- If that takes more than a few seconds on a streamed request, the reply starts at once and SSE comments
+  keep it open. Closing it cancels the warm-up. An engine error after that point arrives as an `error`
+  event in the stream, not as an HTTP status.
 - The server API key, if set, is enforced as for any other model.
 - The app's pre-turn token count (`/v1/responses/input_tokens`) is answered from the engine's own
   `/apply-template` and `/tokenize` routes, so the engine must offer them.

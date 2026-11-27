@@ -19,12 +19,17 @@ class StubResponse:
     """Stands in for the fastapi response classes: keeps what it was built with."""
 
     def __init__(self, content=b"{}", status_code=200, headers=None, **kwargs):
-        self.content = content
+        self.content = self.body_iterator = content
         self.status_code = status_code
         self.headers = headers or {}
+        self.media_type = kwargs.get("media_type")
 
 
-class StubTransportError(Exception):
+class StubHTTPError(Exception):
+    pass
+
+
+class StubTransportError(StubHTTPError):
     pass
 
 
@@ -32,8 +37,19 @@ class StubInvalidURL(Exception):
     pass
 
 
-class StubHTTPError(Exception):
-    pass
+class Pending:
+    """A scripted post that does not answer until released, like an engine still reading a long prompt."""
+
+    def __init__(self):
+        self.release, self.cancelled = asyncio.Event(), False
+
+    async def wait(self):
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return SimpleNamespace(raise_for_status=lambda: None)
 
 
 class StubClient:
@@ -57,6 +73,8 @@ class StubClient:
     async def post(self, url, json=None, headers=None):
         StubClient.posted.append(SimpleNamespace(url=url, json=json, headers=headers))
         step = StubClient.post_script.pop(0)
+        if isinstance(step, Pending):
+            return await step.wait()
         if isinstance(step, Exception):
             raise step
         return step
@@ -1106,6 +1124,143 @@ class WarmUpTests(unittest.TestCase):
                 response = self.forward({"input": history(), "transient_context": "NOW"}, warm_up=failure)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(len(StubClient.sent), 1)
+
+
+ANSWER = b'data: {"type": "response.output_text.delta", "delta": "hi"}\n\n'
+
+
+class SlowWarmUpTests(unittest.TestCase):
+    """A long read must not leave the app waiting in silence, or carrying on after it has gone."""
+
+    def setUp(self):
+        self.module = load_module()
+        self.module.WARM_UP_WAIT_S = 0.01
+        StubClient.sent, StubClient.script, StubClient.posted, StubClient.post_script = [], [], [], []
+        StubClient.metrics_text = ""  # another test's counters would start the progress reporter, which also posts
+        self.request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        self.payload = {"model": "qwen", "stream": True, "input": history(), "transient_context": "NOW"}
+
+    async def start(self):
+        """forward() must answer promptly however long the engine takes; a test that waits longer has failed."""
+        return await asyncio.wait_for(self.module.forward(self.request, self.payload, ENGINE), 1)
+
+    def run_slow(self, upstream, chunks_before_release=3):
+        """Start a request whose warm-up hangs, take some chunks, release it, and take the rest."""
+        pending = Pending()
+        StubClient.post_script, StubClient.script = [pending], [upstream]
+
+        async def scenario():
+            response = await self.start()
+            stream = response.body_iterator
+            early = [await asyncio.wait_for(anext(stream), 1) for _ in range(chunks_before_release)]
+            sent_early = len(StubClient.sent)
+            pending.release.set()
+            return response, early, sent_early, b"".join([chunk async for chunk in stream])
+        return asyncio.run(scenario())
+
+    def test_the_app_gets_keepalives_while_the_engine_is_still_reading(self):
+        upstream = UpstreamResponse(content_type="text/event-stream", chunks=[ANSWER])
+        response, early, sent_early, rest = self.run_slow(upstream)
+        self.assertEqual((response.status_code, response.media_type), (200, "text/event-stream"))
+        self.assertEqual(early, [self.module.KEEPALIVE] * 3)
+        self.assertTrue(self.module.KEEPALIVE.startswith(b":") and self.module.KEEPALIVE.endswith(b"\n\n"))
+        self.assertEqual(sent_early, 0)
+        self.assertIn(ANSWER, rest)
+
+    def test_an_engine_error_after_a_slow_warm_up_reaches_the_app_as_a_stream_error(self):
+        upstream = UpstreamResponse(body=b'{"error": {"message": "prompt is too long"}}', status_code=400)
+        *_, rest = self.run_slow(upstream)
+        event = json.loads(rest.split(b"data: ")[-1])
+        self.assertEqual(event["type"], "error")
+        self.assertIn("prompt is too long", event["error"]["message"])
+        self.assertIn("400", event["error"]["message"])
+
+    def test_an_unreachable_engine_after_a_slow_warm_up_reaches_the_app_as_a_stream_error(self):
+        pending = Pending()
+        StubClient.post_script, StubClient.script = [pending], [StubTransportError("down"), StubTransportError("down")]
+
+        async def scenario():
+            response = await self.start()
+            pending.release.set()
+            return b"".join([chunk async for chunk in response.body_iterator])
+        event = json.loads(asyncio.run(scenario()).split(b"data: ")[-1])
+        self.assertEqual(event["type"], "error")
+        self.assertIn("down", event["error"]["message"])
+
+    def test_leaving_during_a_slow_warm_up_cancels_it_and_sends_nothing_more(self):
+        pending = Pending()
+        StubClient.post_script = [pending]
+
+        async def scenario():
+            response = await self.start()
+            await anext(response.body_iterator)
+            await response.body_iterator.aclose()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            return len([task for task in asyncio.all_tasks() if task is not asyncio.current_task()])
+        left_running = asyncio.run(scenario())
+        self.assertTrue(pending.cancelled)
+        self.assertEqual(StubClient.sent, [])
+        self.assertEqual(left_running, 0)
+
+    def test_closing_the_reply_closes_what_it_wraps_straight_away(self):
+        closed = []
+
+        async def inner():
+            try:
+                yield b"a"
+                yield b"b"
+            finally:
+                closed.append(True)
+
+        async def scenario():
+            held = inner()  # a live reference, so only an explicit close can run its cleanup
+            wrapper = self.module._with_prefill_report(held, SimpleNamespace(finish=lambda: None),
+                                                       asyncio.create_task(asyncio.sleep(0)))
+            await anext(wrapper)
+            await wrapper.aclose()
+            return list(closed)
+        self.assertEqual(asyncio.run(scenario()), [True])
+
+    def test_cancelling_the_request_during_the_first_wait_leaves_no_task_behind(self):
+        self.module.WARM_UP_WAIT_S = 60
+        pending = Pending()
+        StubClient.post_script = [pending]
+        # Counters the progress reporter can read, so it is still polling when the request is cancelled.
+        StubClient.metrics_text = "splash_scheduler_prefill_rows_total 0\nsplash_cache_reused_tokens_total 0\n"
+        self.addCleanup(setattr, StubClient, "metrics_text", "")
+
+        async def count_tokens(payload, engine):
+            return 50000
+        self.module._count_prompt_tokens = count_tokens
+
+        async def scenario():
+            request = asyncio.create_task(self.module.forward(self.request, self.payload, ENGINE))
+            await asyncio.sleep(0.02)
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+            for _ in range(3):
+                await asyncio.sleep(0)
+            return len([task for task in asyncio.all_tasks() if task is not asyncio.current_task()])
+        left_running = asyncio.run(scenario())
+        self.assertTrue(pending.cancelled)
+        self.assertEqual(left_running, 0)
+
+    def test_an_unexpected_warm_up_failure_is_logged_and_the_request_still_goes(self):
+        StubClient.post_script, StubClient.script = [RuntimeError("boom")], [UpstreamResponse()]
+        self.payload["stream"] = False
+        with self.assertLogs("nativ.remote_engine", "WARNING") as logs:
+            response = asyncio.run(self.start())
+        self.assertEqual((response.status_code, len(StubClient.sent)), (200, 1))
+        self.assertIn("boom", "".join(logs.output))
+
+    def test_a_warm_up_on_a_stale_connection_is_tried_again(self):
+        StubClient.post_script = [StubTransportError("stale"), JSONReply({})]
+        StubClient.script = [UpstreamResponse()]
+        self.payload["stream"] = False
+        asyncio.run(self.start())
+        self.assertEqual(len(StubClient.posted), 2)
 
 
 class ThinkingSettingsTests(unittest.TestCase):

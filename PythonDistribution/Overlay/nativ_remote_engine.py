@@ -12,6 +12,7 @@ The engines file maps a Nativ model id to its engine:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.client
 import json
 import logging
@@ -22,7 +23,7 @@ import time
 import urllib.request
 import uuid
 from functools import partial
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 import httpx
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -46,6 +47,12 @@ CONNECT_TIMEOUT_S = 10
 SEND_ATTEMPTS = 2
 
 SSE_EVENT_END = b"\n\n"
+# A comment line: the app's stream readers skip it, and it keeps an idle stream from timing out.
+KEEPALIVE = b": keepalive\n\n"
+# How long a streamed request waits on a warm-up before the reply is started without it, and the gap between comments.
+WARM_UP_WAIT_S = 5
+# How much of an engine's error body is repeated to the app inside a stream.
+ERROR_DETAIL_CHARS = 2000
 
 # Compaction: the app asks for it with `context_management`; the engine ignores that, so the summary is made here.
 COMPACTION_TYPE = "compaction"
@@ -288,14 +295,24 @@ def warm_up_body(body: dict[str, Any], history_key: str) -> dict[str, Any]:
     return warm
 
 
+async def _with_retry(call: Callable[[], Awaitable[Any]]) -> Any:
+    """Run an engine call, trying again when the connection fails, as an idle pooled one the engine closed does."""
+    for _ in range(SEND_ATTEMPTS - 1):
+        try:
+            return await call()
+        except httpx.TransportError:
+            pass
+    return await call()
+
+
 async def _warm_up(client: Any, url: str, headers: dict[str, str], body: dict[str, Any]) -> None:
     """Have the engine process the conversation without its trailing current-state block. Splash keeps reusable state
     only at the end of a prompt, so with the block there the next turn diverges before that point and re-reads the
     whole conversation. This leaves a point the next turn can use. Best-effort: the real request follows regardless."""
     try:
-        (await client.post(url, json=body, headers=headers)).raise_for_status()
-    except (httpx.HTTPError, httpx.InvalidURL) as error:
-        log.warning("warm-up failed; the next turn may re-read the whole conversation: %s", error)
+        (await _with_retry(partial(client.post, url, json=body, headers=headers))).raise_for_status()
+    except Exception:  # best-effort step ahead of the real request, which follows regardless; the failure is logged
+        log.warning("warm-up failed; the next turn may re-read the whole conversation", exc_info=True)
 
 
 def without_remote_preload(arguments: list[str], engines: dict[str, dict[str, str]]) -> list[str]:
@@ -464,11 +481,12 @@ async def _with_prefill_report(relay: AsyncIterator[bytes], reporter: PrefillRep
                                task: asyncio.Task) -> AsyncIterator[bytes]:
     """Relay the stream, ending the progress ring when the first generated text arrives or the stream stops."""
     try:
-        async for chunk in relay:
-            if b'.delta"' in chunk and not task.done():
-                task.cancel()
-                reporter.finish()
-            yield chunk
+        async with contextlib.aclosing(relay) as chunks:
+            async for chunk in chunks:
+                if b'.delta"' in chunk and not task.done():
+                    task.cancel()
+                    reporter.finish()
+                yield chunk
     finally:
         task.cancel()
         reporter.finish()
@@ -855,6 +873,47 @@ def sorted_keys(value: Any) -> Any:
     return value
 
 
+def _is_event_stream(response: httpx.Response) -> bool:
+    return "text/event-stream" in response.headers.get("content-type", "")
+
+
+def _error_event(message: str) -> bytes:
+    """A failure as the app's stream readers recognise it, for use once the reply has already started."""
+    data = {"type": "error", "error": {"message": message, "type": "engine_error"}}
+    return b"event: error\ndata: " + json.dumps(data).encode() + SSE_EVENT_END
+
+
+async def _continue_after_warm_up(warm_up: asyncio.Task, send: Callable[[], Awaitable[Any]],
+                                  relay: Callable[[Any], AsyncIterator[bytes]]) -> AsyncIterator[bytes]:
+    """Hold the app's stream open with comments while a long warm-up runs, then carry on with the engine's answer.
+    The reply has already started, so a failure is reported inside the stream. Closing the stream, as when the app
+    leaves, cancels the warm-up, and the engine drops a request whose connection closes."""
+    try:
+        while not warm_up.done():
+            yield KEEPALIVE
+            await asyncio.wait({warm_up}, timeout=WARM_UP_WAIT_S)
+        try:
+            response = await send()
+        except (httpx.TransportError, httpx.InvalidURL) as error:
+            log.warning("remote engine unavailable: %s", error)
+            yield _error_event(f"external engine unavailable: {error}")
+            return
+        if response.status_code == 200 and _is_event_stream(response):
+            async with contextlib.aclosing(relay(response)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+            return
+        try:
+            detail = (await response.aread()).decode(errors="replace")[:ERROR_DETAIL_CHARS]
+        except httpx.HTTPError as error:
+            detail = str(error)
+        finally:
+            await response.aclose()
+        yield _error_event(f"external engine answered {response.status_code}: {detail}")
+    finally:
+        warm_up.cancel()
+
+
 async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str]) -> Response:
     """Send the request to the external engine and return its answer, streaming included."""
     path = upstream_path(request.url.path)
@@ -891,29 +950,43 @@ async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str])
         reporter = PrefillReporter(uuid.uuid4().hex, partial(_count_prompt_tokens, payload, engine),
                                    partial(_read_prefill_counters, root, engine), _print_log_line)
         prefill_task = asyncio.create_task(reporter.run())
-    if context[1] is not None:
-        stable = {**body, history_key: _with_context(body.get(history_key), (context[0], None), path == "/responses")}
-        await _warm_up(client, url, headers, warm_up_body(stable, history_key))
-    last_error: Exception | None = None
-    for _ in range(SEND_ATTEMPTS):
-        try:
-            response = await client.send(client.build_request("POST", url, headers=headers, json=sent), stream=True)
-            break
-        except httpx.InvalidURL as error:
-            _stop_prefill(prefill_task)
-            return _unavailable(error)
-        except httpx.TransportError as error:
-            last_error = error
-    else:
+
+    def relay(response: httpx.Response) -> AsyncIterator[bytes]:
+        if path == "/responses":
+            return _relay_responses_and_close(response, compact, payload.get("model"))
+        return _relay_and_close(response)
+
+    def open_reply() -> Awaitable[httpx.Response]:
+        return client.send(client.build_request("POST", url, headers=headers, json=sent), stream=True)
+
+    send = partial(_with_retry, open_reply)
+    warm_up: asyncio.Task | None = None
+    try:
+        if context[1] is not None:
+            stable = {**body, history_key: _with_context(body.get(history_key), (context[0], None), path == "/responses")}
+            warm_up = asyncio.create_task(_warm_up(client, url, headers, warm_up_body(stable, history_key)))
+            # A buffered request has nothing to send early, so it waits for the warm-up however long it takes.
+            await asyncio.wait({warm_up}, timeout=WARM_UP_WAIT_S if body.get("stream") else None)
+            if not warm_up.done():
+                stream = _continue_after_warm_up(warm_up, send, relay)
+                if reporter is not None:
+                    stream = _with_prefill_report(stream, reporter, prefill_task)
+                return StreamingResponse(stream, media_type="text/event-stream")
+        response = await send()
+    except (httpx.TransportError, httpx.InvalidURL) as error:
         _stop_prefill(prefill_task)
-        return _unavailable(last_error)
+        return _unavailable(error)
+    except asyncio.CancelledError:
+        if warm_up is not None:
+            warm_up.cancel()
+        _stop_prefill(prefill_task)
+        raise
     passthrough = {k: v for k, v in response.headers.items() if k.lower() not in HOP_HEADERS}
-    if "text/event-stream" in response.headers.get("content-type", ""):
-        relay = (_relay_responses_and_close(response, compact, payload.get("model")) if path == "/responses"
-                 else _relay_and_close(response))
+    if _is_event_stream(response):
+        stream = relay(response)
         if reporter is not None:
-            relay = _with_prefill_report(relay, reporter, prefill_task)
-        return StreamingResponse(relay, status_code=response.status_code, headers=passthrough)
+            stream = _with_prefill_report(stream, reporter, prefill_task)
+        return StreamingResponse(stream, status_code=response.status_code, headers=passthrough)
     _stop_prefill(prefill_task)
     try:
         content = await response.aread()
