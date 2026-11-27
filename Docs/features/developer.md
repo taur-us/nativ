@@ -53,7 +53,8 @@ as before. The file is read per request, so edits apply without a restart.
   so the engine receives them in the request body. The thinking switch is sent as
   `chat_template_kwargs.enable_thinking` and the thinking budget as `thinking_token_budget`, the names
   engines such as Splash read. A structured-output `response_format` on a Responses request is sent as
-  `text.format`.
+  `text.format`. Changing the thinking switch during a chat changes the start of the prompt Splash
+  renders, so the next reply re-reads the conversation.
 - The app sends attached-document excerpts, work-pane state and one-off guidance as `transient_context`,
   and excerpts of older tool results as `tool_result_context`. Engines ignore both fields, so they are
   written into the prompt where the bundled server puts them: the excerpts ahead of the conversation
