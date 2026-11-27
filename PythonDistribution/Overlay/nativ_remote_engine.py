@@ -86,6 +86,8 @@ RECOVERY_NOTE_BYTES = 800
 RECOVERY_MIN_NOTE_BYTES = 96
 RECOVERY_MAX_BYTES = 8192
 INSTRUCTION_ROLES = ("system", "developer")
+# The warm-up only has to make the engine process the prompt, so it asks for as little output as can be asked.
+WARM_UP_OUTPUT_TOKENS = 1
 
 # Splash exposes engine-wide memory in use; it reports no per-reply peak, so this stands in for the app's peak figure.
 PREFILL_ROWS = re.compile(r"^splash_scheduler_prefill_rows_total\s+([0-9.eE+-]+)", re.M)
@@ -270,6 +272,28 @@ def _with_context(history: Any, context: tuple[str | None, str | None], typed: b
     if current is not None:
         items.append(user(current))
     return items
+
+
+def warm_up_body(body: dict[str, Any], history_key: str) -> dict[str, Any]:
+    """The request cut down to processing its prompt: not streamed, not stored, and capped at the smallest output."""
+    warm = {key: value for key, value in body.items() if key not in ("stream_options", "return_progress")}
+    warm["stream"] = False
+    if history_key == "input":
+        warm["store"], limit = False, "max_output_tokens"
+    else:
+        limit = "max_completion_tokens" if "max_completion_tokens" in warm else "max_tokens"
+    warm[limit] = WARM_UP_OUTPUT_TOKENS
+    return warm
+
+
+async def _warm_up(client: Any, url: str, headers: dict[str, str], body: dict[str, Any]) -> None:
+    """Have the engine process the conversation without its trailing current-state block. Splash keeps reusable state
+    only at the end of a prompt, so with the block there the next turn diverges before that point and re-reads the
+    whole conversation. This leaves a point the next turn can use. Best-effort: the real request follows regardless."""
+    try:
+        (await client.post(url, json=body, headers=headers)).raise_for_status()
+    except (httpx.HTTPError, httpx.InvalidURL) as error:
+        log.warning("warm-up failed; the next turn may re-read the whole conversation: %s", error)
 
 
 def without_remote_preload(arguments: list[str], engines: dict[str, dict[str, str]]) -> list[str]:
@@ -755,8 +779,9 @@ async def compaction_item(client: Any, url: str, headers: dict[str, str], body: 
     """After a reply whose prompt reached the threshold, shrink the conversation. Old tool output is cleared first,
     which costs no model call. If that leaves too much, the engine is asked for a handoff summary sealed with a
     verbatim tail; that request is the prompt just answered, less its current-state block, plus one instruction, so
-    the prefix cache serves it. `body` holds the conversation without the request-local `context` blocks, which are
-    never sealed. Whatever goes wrong, the conversation is left uncompacted and the failure is logged."""
+    the prefix cache serves it (after a current-state block, from the point the warm-up left). `body` holds the
+    conversation without the request-local `context` blocks, which are never sealed. Whatever goes wrong, the
+    conversation is left uncompacted and the failure is logged."""
     prompt_tokens = (response.get("usage") or {}).get("input_tokens")
     items = body.get("input")
     if not isinstance(prompt_tokens, int) or prompt_tokens < threshold or not isinstance(items, list):
@@ -850,6 +875,9 @@ async def forward(request: Any, payload: dict[str, Any], engine: dict[str, str])
         reporter = PrefillReporter(uuid.uuid4().hex, partial(_count_prompt_tokens, payload, engine),
                                    partial(_read_prefill_counters, root, engine), _print_log_line)
         prefill_task = asyncio.create_task(reporter.run())
+    if context[1] is not None:
+        stable = {**body, history_key: _with_context(body.get(history_key), (context[0], None), path == "/responses")}
+        await _warm_up(client, url, headers, warm_up_body(stable, history_key))
     last_error: Exception | None = None
     for _ in range(SEND_ATTEMPTS):
         try:

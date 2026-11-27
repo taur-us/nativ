@@ -59,6 +59,10 @@ as before. The file is read per request, so edits apply without a restart.
   written into the prompt where the bundled server puts them: the excerpts ahead of the conversation
   (only for results it no longer shows, including ones compaction cleared) and the current state as the
   last message. Token counts include them, and neither is stored in a compaction item.
+- When there is current state to send, the engine first gets the conversation without it, capped at one
+  output token. Splash keeps reusable state only at the end of a prompt, so without this the next turn
+  would diverge before that point and re-read the whole conversation. The extra request does the reading
+  the real one would have done, so only the current state is read twice over successive turns.
 - The server API key, if set, is enforced as for any other model.
 - The app's pre-turn token count (`/v1/responses/input_tokens`) is answered from the engine's own
   `/apply-template` and `/tokenize` routes, so the engine must offer them.

@@ -960,7 +960,7 @@ class RequestContextTests(unittest.TestCase):
 
     def sent(self, payload, path="/v1/responses"):
         request = SimpleNamespace(url=SimpleNamespace(path=path), headers={})
-        StubClient.script = [UpstreamResponse()]
+        StubClient.script, StubClient.post_script = [UpstreamResponse()], [JSONReply({})]
         asyncio.run(self.module.forward(request, {"model": "qwen", **payload}, ENGINE))
         return StubClient.sent[-1].json
 
@@ -1033,17 +1033,79 @@ class RequestContextTests(unittest.TestCase):
     def test_neither_block_is_sealed_into_a_compaction_item_and_the_summary_keeps_the_cached_prefix(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
         StubClient.script = [UpstreamResponse(body=json.dumps({"output": [], "usage": {"input_tokens": 1000}}).encode())]
-        StubClient.post_script = [summary_reply()]
+        StubClient.post_script = [JSONReply({}), summary_reply()]
         payload = {"model": "qwen", "input": chat_history(), "transient_context": "NOW STATE",
                    "tool_result_context": excerpts(("gone", "LOST FACT")),
                    "context_management": [{"type": "compaction", "compact_threshold": 500}]}
         response = asyncio.run(self.module.forward(request, payload, ENGINE))
-        sent, summary = StubClient.sent[-1].json["input"], StubClient.posted[0].json["input"]
+        sent, summary = StubClient.sent[-1].json["input"], StubClient.posted[-1].json["input"]
         self.assertEqual(summary[:-1], sent[:-1])  # everything but the current-state block is the prompt just answered
+        self.assertEqual(summary[:-1], StubClient.posted[0].json["input"])  # and what the warm-up left cached
         self.assertNotIn("NOW STATE", json.dumps(summary))
         capsule = json.dumps(self.module.expand_compaction(json.loads(response.content)["output"][-1:]))
         self.assertNotIn("NOW STATE", capsule)
         self.assertNotIn("LOST FACT", capsule)
+
+
+class WarmUpTests(unittest.TestCase):
+    """The engine keeps reusable state only at the end of a prompt. With a block trailing the history, that point
+    lies past where the next turn diverges, so the history is first processed on its own."""
+
+    def setUp(self):
+        self.module = load_module()
+        StubClient.sent, StubClient.script, StubClient.posted, StubClient.post_script = [], [], [], []
+
+    def forward(self, payload, path="/v1/responses", warm_up=None):
+        request = SimpleNamespace(url=SimpleNamespace(path=path), headers={"content-type": "application/json"})
+        StubClient.script, StubClient.post_script = [UpstreamResponse()], [warm_up or JSONReply({})]
+        return asyncio.run(self.module.forward(request, {"model": "qwen", **payload}, ENGINE))
+
+    def test_the_history_alone_is_processed_before_a_request_with_a_trailing_block(self):
+        sent_when_warmed = []
+
+        class Reply(JSONReply):
+            def raise_for_status(self):
+                sent_when_warmed.append(len(StubClient.sent))
+
+        self.forward({"input": history(), "transient_context": "NOW", "stream": True, "store": True,
+                      "return_progress": True, "max_output_tokens": 900, "tools": [{"type": "function", "name": "f"}],
+                      "tool_result_context": excerpts(("gone", "LOST"))}, warm_up=Reply({}))
+        (warm,), (real,) = StubClient.posted, StubClient.sent
+        self.assertEqual(sent_when_warmed, [0])
+        self.assertEqual((warm.url, warm.headers), (real.url, real.headers))
+        self.assertEqual(warm.json["input"], real.json["input"][:-1])
+        self.assertEqual((warm.json["stream"], warm.json["store"], warm.json["max_output_tokens"]), (False, False, 1))
+        self.assertNotIn("return_progress", warm.json)
+        for field in ("model", "tools", "chat_template_kwargs"):
+            self.assertEqual(warm.json.get(field), real.json.get(field))
+        self.assertEqual(real.json["max_output_tokens"], 900)
+
+    def test_a_chat_completions_warm_up_caps_whichever_output_limit_the_client_named(self):
+        for limit in ("max_tokens", "max_completion_tokens"):
+            with self.subTest(limit=limit):
+                StubClient.sent, StubClient.posted = [], []
+                self.forward({"messages": [{"role": "user", "content": "hi"}], "transient_context": "NOW", limit: 900,
+                              "stream": True, "stream_options": {"include_usage": True}}, "/v1/chat/completions")
+                warm = StubClient.posted[0].json
+                self.assertEqual(warm[limit], 1)
+                self.assertEqual(warm["messages"], [{"role": "user", "content": "hi"}])
+                self.assertNotIn("stream_options", warm)
+                self.assertNotIn("store", warm)
+
+    def test_nothing_extra_is_sent_when_no_block_trails_the_history(self):
+        for extra in ({}, {"tool_result_context": excerpts(("gone", "LOST"))}, {"transient_context": ""}):
+            with self.subTest(extra=extra):
+                StubClient.posted = []
+                self.forward({"input": history(), **extra})
+                self.assertEqual(StubClient.posted, [])
+
+    def test_a_failed_warm_up_never_costs_the_request(self):
+        for failure in (JSONReply({}, error=StubHTTPError("busy")), StubHTTPError("refused"), StubInvalidURL("bad")):
+            with self.subTest(failure=failure):
+                StubClient.sent = []
+                response = self.forward({"input": history(), "transient_context": "NOW"}, warm_up=failure)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(len(StubClient.sent), 1)
 
 
 class ThinkingSettingsTests(unittest.TestCase):
