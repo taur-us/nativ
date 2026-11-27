@@ -361,6 +361,23 @@ class PreloadTests(unittest.TestCase):
         arguments = ["--model", "other", "--stt-model", "qwen", "--port", "8080"]
         self.assertEqual(self.strip(*arguments), arguments)
 
+    def test_the_listed_models_draft_settings_go_with_it(self):
+        spaced = ("--draft-model", "drafter", "--model", "qwen", "--draft-kind", "dflash", "--draft-block-size", "4")
+        joined = ("--model=qwen", "--draft-model=drafter", "--draft-kind=dflash", "--draft-block-size=4")
+        for arguments in (spaced, joined):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.strip("--max-tokens", "9", *arguments, "--port", "8080"),
+                                 ["--max-tokens", "9", "--port", "8080"])
+
+    def test_draft_settings_stay_when_the_preloaded_model_is_not_listed(self):
+        for arguments in (["--model", "other", "--draft-model", "drafter"], ["--draft-model", "drafter"]):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.strip(*arguments), arguments)
+
+    def test_flags_without_a_value_do_not_swallow_the_next_one(self):
+        self.assertEqual(self.strip("--trust-remote-code", "--model", "qwen", "--reload"),
+                         ["--trust-remote-code", "--reload"])
+
     def test_a_trailing_model_flag_is_kept(self):
         self.assertEqual(self.strip("--port", "8080", "--model"), ["--port", "8080", "--model"])
 

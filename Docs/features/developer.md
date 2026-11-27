@@ -105,6 +105,8 @@ as before. The file is read per request, so edits apply without a restart.
   an unforwarded API does not work with a forwarded model.
 - Model-load settings such as KV-cache bits, prefix caching, and draft models belong to the engine and
   have no effect on a forwarded model.
+  When the active model is a listed one, the app's draft model launch options are dropped with it, so
+  that drafter is not loaded beside a local model chosen later.
 
 ## Hugging Face token
 

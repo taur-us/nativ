@@ -46,6 +46,8 @@ HOP_HEADERS = frozenset({
     "proxy-authorization", "server", "te", "trailer", "transfer-encoding", "upgrade",
 })
 CONNECT_TIMEOUT_S = 10
+# Launch options that set up speculative decoding for the model named by --model.
+DRAFT_OPTIONS = frozenset({"--draft-model", "--draft-kind", "--draft-block-size"})
 # The bundled server's loader stages that leave nothing loaded and nothing on the way. "ready" is not one: with no
 # model reported it means the old model has gone and the next has not started to report.
 ABANDONED_LOAD_STAGES = frozenset({"failed", "cancelled"})
@@ -409,22 +411,32 @@ async def _warm_up(client: Any, url: str, headers: dict[str, str], body: dict[st
         log.warning("warm-up failed; the next turn may re-read the whole conversation", exc_info=True)
 
 
-def without_remote_preload(arguments: list[str], engines: dict[str, dict[str, str]]) -> list[str]:
-    """Drop `--model <id>` from the launch arguments when that model is served by an external engine,
-    so the server does not also load it in-process."""
+def _without_options(arguments: list[str], drop: Callable[[str, str], bool]) -> list[str]:
+    """The arguments without each `--name value` or `--name=value` for which `drop(name, value)` is true."""
     result: list[str] = []
     position = 0
     while position < len(arguments):
-        argument = arguments[position]
-        if (argument == "--model" and position + 1 < len(arguments)
-                and engine_for({"model": arguments[position + 1]}, engines) is not None):
-            position += 2
-        elif argument.startswith("--model=") and engine_for({"model": argument.removeprefix("--model=")}, engines) is not None:
-            position += 1
+        name, joined, value = arguments[position].partition("=")
+        width = 1
+        if not joined and position + 1 < len(arguments):
+            value, width = arguments[position + 1], 2
+        if (joined or width == 2) and drop(name, value):
+            position += width
         else:
-            result.append(argument)
+            result.append(arguments[position])
             position += 1
     return result
+
+
+def without_remote_preload(arguments: list[str], engines: dict[str, dict[str, str]]) -> list[str]:
+    """Drop `--model <id>` from the launch arguments when that model is served by an external engine, so the server
+    does not also load it in-process. Its draft model settings go too: the server would otherwise load that drafter
+    beside whichever other model was loaded later."""
+    kept = _without_options(
+        arguments, lambda name, value: name == "--model" and engine_for({"model": value}, engines) is not None)
+    if len(kept) == len(arguments):
+        return kept
+    return _without_options(kept, lambda name, value: name in DRAFT_OPTIONS)
 
 
 def _engine_headers(engine: dict[str, str]) -> dict[str, str]:
