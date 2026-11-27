@@ -43,6 +43,8 @@ HOP_HEADERS = frozenset({
     "proxy-authorization", "server", "te", "trailer", "transfer-encoding", "upgrade",
 })
 CONNECT_TIMEOUT_S = 10
+# The bundled server's loader stages after which no model is being loaded in-process.
+FINISHED_LOAD_STAGES = frozenset({"ready", "failed", "cancelled"})
 # An idle pooled connection the engine has since closed fails on first use; one more try opens a new one.
 SEND_ATTEMPTS = 2
 
@@ -564,9 +566,10 @@ def start_status_refresher() -> None:
 
 
 def with_remote_model_loaded(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Report a ready externally served model as the loaded one when nothing is loaded in-process, so the
+    """Report a ready externally served model as the loaded one when nothing is loaded or loading in-process, so the
     app shows it as available and sizes its context limit (and so its compaction threshold) from the engine."""
-    if snapshot.get("loaded_model"):
+    progress = snapshot.get("model_load_progress")
+    if snapshot.get("loaded_model") or (progress and progress.get("stage") not in FINISHED_LOAD_STAGES):
         return snapshot
     with _ready_lock:
         ready = dict(_ready_engines)
@@ -575,7 +578,7 @@ def with_remote_model_loaded(snapshot: dict[str, Any]) -> dict[str, Any]:
     model, state = next(iter(ready.items()))
     context = state["context"]
     limits = [limit for limit in (snapshot.get("configured_context_limit"), context) if limit]
-    return {**snapshot, "loaded_model": model, "loaded_context_size": context,
+    return {**snapshot, "loaded_model": model, "model_ready": True, "loaded_context_size": context,
             "effective_context_limit": min(limits) if limits else None}
 
 

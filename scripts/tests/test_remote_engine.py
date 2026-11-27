@@ -550,6 +550,26 @@ class RemoteModelStatusTests(unittest.TestCase):
         snapshot = {"loaded_model": None}
         self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
 
+    def test_the_reported_engine_model_is_also_reported_ready(self):
+        self.refresh(b'{"ready": true}')
+        shown = self.module.with_remote_model_loaded({"loaded_model": None, "model_ready": False,
+                                                      "model_load_progress": None})
+        self.assertTrue(shown["model_ready"])
+
+    def test_nothing_is_claimed_while_a_model_is_loading_in_process(self):
+        self.refresh(b'{"ready": true}')
+        snapshot = {"loaded_model": None, "model_ready": False,
+                    "model_load_progress": {"stage": "evaluating_layers"}}
+        self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
+
+    def test_a_load_that_failed_or_was_cancelled_does_not_hide_the_engine(self):
+        self.refresh(b'{"ready": true}')
+        for stage in ("failed", "cancelled"):
+            with self.subTest(stage=stage):
+                shown = self.module.with_remote_model_loaded({"loaded_model": None,
+                                                              "model_load_progress": {"stage": stage}})
+                self.assertEqual(shown["loaded_model"], "qwen")
+
 
 def summary_reply(text="SUM"):
     return JSONReply({"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]})
