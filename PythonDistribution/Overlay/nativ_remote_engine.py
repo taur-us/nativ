@@ -46,8 +46,9 @@ HOP_HEADERS = frozenset({
     "proxy-authorization", "server", "te", "trailer", "transfer-encoding", "upgrade",
 })
 CONNECT_TIMEOUT_S = 10
-# The bundled server's loader stages after which no model is being loaded in-process.
-FINISHED_LOAD_STAGES = frozenset({"ready", "failed", "cancelled"})
+# The bundled server's loader stages that leave nothing loaded and nothing on the way. "ready" is not one: with no
+# model reported it means the old model has gone and the next has not started to report.
+ABANDONED_LOAD_STAGES = frozenset({"failed", "cancelled"})
 # An idle pooled connection the engine has since closed fails on first use; one more try opens a new one.
 SEND_ATTEMPTS = 2
 
@@ -661,7 +662,7 @@ def with_remote_model_loaded(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Report a ready externally served model as the loaded one when nothing is loaded or loading in-process, so the
     app shows it as available and sizes its context limit (and so its compaction threshold) from the engine."""
     progress = snapshot.get("model_load_progress")
-    if snapshot.get("loaded_model") or (progress and progress.get("stage") not in FINISHED_LOAD_STAGES):
+    if snapshot.get("loaded_model") or (progress and progress.get("stage") not in ABANDONED_LOAD_STAGES):
         return snapshot
     with _ready_lock:
         ready = dict(_ready_engines)

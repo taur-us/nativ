@@ -665,6 +665,12 @@ class RemoteModelStatusTests(unittest.TestCase):
                     "model_load_progress": {"stage": "evaluating_layers"}}
         self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
 
+    def test_nothing_is_claimed_while_one_local_model_is_swapped_for_another(self):
+        # The old model is already unloaded but its finished progress is still published.
+        self.refresh(b'{"ready": true}')
+        snapshot = {"loaded_model": None, "model_ready": False, "model_load_progress": {"stage": "ready"}}
+        self.assertIs(self.module.with_remote_model_loaded(snapshot), snapshot)
+
     def test_a_load_that_failed_or_was_cancelled_does_not_hide_the_engine(self):
         self.refresh(b'{"ready": true}')
         for stage in ("failed", "cancelled"):
